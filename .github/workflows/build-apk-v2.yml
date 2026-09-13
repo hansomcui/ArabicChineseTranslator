@@ -1,0 +1,525 @@
+name: Build Android APK V2
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/hansom/arzh
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'ArabicChineseTranslator'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.hansom.arzh'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.hansom.arzh.v2'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 2
+                  versionName '2.0'
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="阿语实时翻译 V2"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#C62828</item>
+                  <item name="android:navigationBarColor">#111111</item>
+                  <item name="android:statusBarColor">#111111</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/hansom/arzh/MainActivity.java <<'EOF'
+          package com.hansom.arzh;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.app.AlertDialog;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.text.InputType;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          import java.io.BufferedReader;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.io.OutputStream;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.concurrent.ConcurrentLinkedQueue;
+          import java.util.concurrent.atomic.AtomicBoolean;
+
+          public class MainActivity extends Activity {
+
+              private SpeechRecognizer recognizer;
+              private Intent speechIntent;
+              private boolean listening = false;
+
+              private TextView arabicText;
+              private TextView chineseText;
+              private TextView statusText;
+              private Button startButton;
+
+              private SharedPreferences prefs;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              private final ConcurrentLinkedQueue<String> queue = new ConcurrentLinkedQueue<>();
+              private final AtomicBoolean translating = new AtomicBoolean(false);
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  prefs = getSharedPreferences("translator_v2", MODE_PRIVATE);
+
+                  buildUi();
+                  setupRecognizer();
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(
+                              new String[]{Manifest.permission.RECORD_AUDIO},
+                              1001
+                      );
+                  }
+
+                  if (prefs.getString("apiKey", "").isEmpty()) {
+                      showFirstTimeKeyDialog();
+                  }
+              }
+
+              private void buildUi() {
+                  ScrollView scroll = new ScrollView(this);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(32, 42, 32, 42);
+                  root.setBackgroundColor(Color.rgb(245,245,245));
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("阿语 → 中文 实时翻译");
+                  title.setTextSize(26);
+                  title.setTextColor(Color.BLACK);
+                  title.setGravity(Gravity.CENTER);
+                  title.setTypeface(null, 1);
+                  root.addView(title);
+
+                  statusText = new TextView(this);
+                  statusText.setText("● 待机");
+                  statusText.setTextSize(15);
+                  statusText.setGravity(Gravity.CENTER);
+                  statusText.setPadding(0,20,0,20);
+                  root.addView(statusText);
+
+                  startButton = new Button(this);
+                  startButton.setText("🎙 开始实时翻译");
+                  startButton.setTextSize(20);
+                  startButton.setAllCaps(false);
+                  startButton.setOnClickListener(v -> toggleListening());
+                  root.addView(startButton);
+
+                  TextView arLabel = new TextView(this);
+                  arLabel.setText("阿语原文");
+                  arLabel.setTextSize(16);
+                  arLabel.setPadding(0,28,0,8);
+                  root.addView(arLabel);
+
+                  arabicText = new TextView(this);
+                  arabicText.setText("等待对方说阿拉伯语……");
+                  arabicText.setTextSize(20);
+                  arabicText.setPadding(24,24,24,24);
+                  arabicText.setBackgroundColor(Color.WHITE);
+                  arabicText.setMinHeight(170);
+                  arabicText.setGravity(Gravity.RIGHT);
+                  root.addView(arabicText);
+
+                  TextView zhLabel = new TextView(this);
+                  zhLabel.setText("中文翻译");
+                  zhLabel.setTextSize(16);
+                  zhLabel.setPadding(0,28,0,8);
+                  root.addView(zhLabel);
+
+                  chineseText = new TextView(this);
+                  chineseText.setText("中文会自动显示在这里。");
+                  chineseText.setTextSize(20);
+                  chineseText.setPadding(24,24,24,24);
+                  chineseText.setBackgroundColor(Color.WHITE);
+                  chineseText.setMinHeight(170);
+                  chineseText.setTextIsSelectable(true);
+                  root.addView(chineseText);
+
+                  Button clear = new Button(this);
+                  clear.setText("清空");
+                  clear.setOnClickListener(v -> {
+                      arabicText.setText("");
+                      chineseText.setText("");
+                  });
+                  root.addView(clear);
+
+                  Button settings = new Button(this);
+                  settings.setText("设置");
+                  settings.setOnClickListener(v -> showFirstTimeKeyDialog());
+                  root.addView(settings);
+
+                  setContentView(scroll);
+              }
+
+              private void showFirstTimeKeyDialog() {
+                  EditText input = new EditText(this);
+                  input.setHint("粘贴 OpenAI API Key");
+                  input.setSingleLine(true);
+                  input.setInputType(
+                          InputType.TYPE_CLASS_TEXT |
+                          InputType.TYPE_TEXT_VARIATION_PASSWORD
+                  );
+
+                  new AlertDialog.Builder(this)
+                          .setTitle("首次设置")
+                          .setMessage("只需要设置一次，以后打开 App 不再显示 API Key。")
+                          .setView(input)
+                          .setPositiveButton("保存", (d, which) -> {
+                              String key = input.getText().toString().trim();
+                              if (!key.isEmpty()) {
+                                  prefs.edit().putString("apiKey", key).apply();
+                                  Toast.makeText(this, "已保存，以后直接使用", Toast.LENGTH_SHORT).show();
+                              }
+                          })
+                          .setNegativeButton("取消", null)
+                          .show();
+              }
+
+              private void setupRecognizer() {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      statusText.setText("本机没有可用语音识别服务");
+                      return;
+                  }
+
+                  recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+
+                  recognizer.setRecognitionListener(new RecognitionListener() {
+                      public void onReadyForSpeech(Bundle params) {
+                          statusText.setText("● 正在听阿语");
+                      }
+
+                      public void onBeginningOfSpeech() {
+                          statusText.setText("● 对方正在说话");
+                      }
+
+                      public void onRmsChanged(float rmsdB) {}
+                      public void onBufferReceived(byte[] buffer) {}
+                      public void onEndOfSpeech() {
+                          statusText.setText("正在处理……");
+                      }
+
+                      public void onError(int error) {
+                          if (listening) {
+                              handler.postDelayed(() -> startRecognition(), 700);
+                          }
+                      }
+
+                      public void onResults(Bundle results) {
+                          ArrayList<String> list =
+                                  results.getStringArrayList(
+                                          SpeechRecognizer.RESULTS_RECOGNITION
+                                  );
+
+                          if (list != null && !list.isEmpty()) {
+                              String ar = list.get(0).trim();
+                              if (!ar.isEmpty()) {
+                                  appendArabic(ar);
+                                  queue.add(ar);
+                                  processQueue();
+                              }
+                          }
+
+                          if (listening) {
+                              handler.postDelayed(() -> startRecognition(), 350);
+                          }
+                      }
+
+                      public void onPartialResults(Bundle partialResults) {
+                          ArrayList<String> list =
+                                  partialResults.getStringArrayList(
+                                          SpeechRecognizer.RESULTS_RECOGNITION
+                                  );
+                          if (list != null && !list.isEmpty()) {
+                              statusText.setText("● " + list.get(0));
+                          }
+                      }
+
+                      public void onEvent(int eventType, Bundle params) {}
+                  });
+
+                  speechIntent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+                  speechIntent.putExtra(
+                          RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                          RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                  );
+                  speechIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "ar-KW");
+                  speechIntent.putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true);
+                  speechIntent.putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 3);
+              }
+
+              private void toggleListening() {
+                  if (!listening) {
+                      if (prefs.getString("apiKey", "").isEmpty()) {
+                          showFirstTimeKeyDialog();
+                          return;
+                      }
+                      listening = true;
+                      startButton.setText("■ 停止翻译");
+                      startRecognition();
+                  } else {
+                      listening = false;
+                      startButton.setText("🎙 开始实时翻译");
+                      statusText.setText("● 已停止");
+                      try { recognizer.cancel(); } catch (Exception ignored) {}
+                  }
+              }
+
+              private void startRecognition() {
+                  if (!listening || recognizer == null) return;
+                  try {
+                      recognizer.startListening(speechIntent);
+                  } catch (Exception ignored) {}
+              }
+
+              private void appendArabic(String s) {
+                  String old = arabicText.getText().toString();
+                  if (old.startsWith("等待对方")) old = "";
+                  arabicText.setText(old + (old.isEmpty() ? "" : "\n\n") + s);
+              }
+
+              private void appendChinese(String s) {
+                  String old = chineseText.getText().toString();
+                  if (old.startsWith("中文会自动")) old = "";
+                  chineseText.setText(old + (old.isEmpty() ? "" : "\n\n") + s);
+              }
+
+              private void processQueue() {
+                  if (!translating.compareAndSet(false, true)) return;
+
+                  new Thread(() -> {
+                      try {
+                          while (true) {
+                              String arabic = queue.poll();
+                              if (arabic == null) break;
+
+                              boolean done = false;
+                              for (int attempt = 0; attempt < 4 && !done; attempt++) {
+                                  int code = translateOnce(arabic);
+                                  if (code == 200) {
+                                      done = true;
+                                  } else if (code == 429) {
+                                      try { Thread.sleep(2000L * (attempt + 1)); }
+                                      catch (InterruptedException ignored) {}
+                                  } else {
+                                      done = true;
+                                  }
+                              }
+                          }
+                      } finally {
+                          translating.set(false);
+                          if (!queue.isEmpty()) processQueue();
+                      }
+                  }).start();
+              }
+
+              private int translateOnce(String arabic) {
+                  String key = prefs.getString("apiKey","");
+                  HttpURLConnection c = null;
+
+                  try {
+                      URL url = new URL("https://api.openai.com/v1/chat/completions");
+                      c = (HttpURLConnection) url.openConnection();
+                      c.setRequestMethod("POST");
+                      c.setConnectTimeout(20000);
+                      c.setReadTimeout(40000);
+                      c.setDoOutput(true);
+                      c.setRequestProperty("Authorization", "Bearer " + key);
+                      c.setRequestProperty("Content-Type", "application/json");
+
+                      JSONObject body = new JSONObject();
+                      body.put("model", "gpt-4o-mini");
+
+                      JSONArray messages = new JSONArray();
+                      messages.put(
+                              new JSONObject()
+                                      .put("role","system")
+                                      .put("content",
+                                              "把阿拉伯语，尤其是科威特、海湾和埃及口语，准确翻译成自然中文。只输出中文，不解释。人名、公司名、金额、数字、日期、油田设备、招投标和合同术语尽量准确保留。")
+                      );
+                      messages.put(
+                              new JSONObject()
+                                      .put("role","user")
+                                      .put("content", arabic)
+                      );
+                      body.put("messages", messages);
+
+                      byte[] data = body.toString().getBytes(StandardCharsets.UTF_8);
+                      try (OutputStream os = c.getOutputStream()) {
+                          os.write(data);
+                      }
+
+                      int code = c.getResponseCode();
+                      InputStream is =
+                              (code >= 200 && code < 300)
+                                      ? c.getInputStream()
+                                      : c.getErrorStream();
+
+                      BufferedReader br = new BufferedReader(
+                              new InputStreamReader(is, StandardCharsets.UTF_8)
+                      );
+                      StringBuilder sb = new StringBuilder();
+                      String line;
+                      while ((line = br.readLine()) != null) sb.append(line);
+
+                      if (code >= 200 && code < 300) {
+                          JSONObject json = new JSONObject(sb.toString());
+                          String zh =
+                                  json.getJSONArray("choices")
+                                          .getJSONObject(0)
+                                          .getJSONObject("message")
+                                          .getString("content")
+                                          .trim();
+                          runOnUiThread(() -> appendChinese(zh));
+                          return 200;
+                      }
+
+                      if (code == 401) {
+                          runOnUiThread(() ->
+                                  appendChinese("[API Key 无效，请到“设置”重新填写]"));
+                      } else if (code == 429) {
+                          runOnUiThread(() ->
+                                  statusText.setText("● 请求较多，正在自动重试"));
+                      } else {
+                          runOnUiThread(() ->
+                                  appendChinese("[翻译接口错误 " + code + "]"));
+                      }
+
+                      return code;
+
+                  } catch (Exception e) {
+                      runOnUiThread(() -> appendChinese("[网络连接异常]"));
+                      return -1;
+                  } finally {
+                      if (c != null) c.disconnect();
+                  }
+              }
+
+              @Override
+              protected void onDestroy() {
+                  listening = false;
+                  if (recognizer != null) recognizer.destroy();
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk ArabicChineseTranslator-V2.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArabicChineseTranslator-V2-APK
+          path: ArabicChineseTranslator-V2.apk
