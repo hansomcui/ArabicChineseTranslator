@@ -1,0 +1,1625 @@
+name: Build Arabic Chinese Translator V10 Free MyVoice
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          mkdir -p app/src/main/java/com/hansom/arzhv10
+          mkdir -p app/src/main/res/values
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'ArabicChineseTranslatorV10'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          android.enableJetifier=true
+          android.suppressUnsupportedCompileSdk=35
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.hansom.arzhv10'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.hansom.arzhv10'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 100
+                  versionName '10.0'
+              }
+          }
+
+          dependencies {
+              implementation 'com.google.mlkit:translate:17.0.3'
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <application
+                  android:allowBackup="true"
+                  android:usesCleartextTraffic="true"
+                  android:label="阿语实时翻译 V10 Free MyVoice"
+                  android:theme="@style/AppTheme">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#C62828</item>
+                  <item name="android:navigationBarColor">#111111</item>
+                  <item name="android:statusBarColor">#111111</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/java/com/hansom/arzhv10/MainActivity.java <<'EOF'
+          package com.hansom.arzhv10;
+
+          import android.Manifest;
+          import android.app.Activity;
+          import android.content.Intent;
+          import android.content.SharedPreferences;
+          import android.content.pm.PackageManager;
+          import android.graphics.Color;
+          import android.media.MediaPlayer;
+          import android.media.MediaRecorder;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.speech.RecognitionListener;
+          import android.speech.RecognizerIntent;
+          import android.speech.SpeechRecognizer;
+          import android.speech.tts.TextToSpeech;
+          import android.speech.tts.UtteranceProgressListener;
+          import android.view.Gravity;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+          import android.widget.Toast;
+          import android.app.AlertDialog;
+
+          import com.google.mlkit.common.model.DownloadConditions;
+          import com.google.mlkit.nl.translate.TranslateLanguage;
+          import com.google.mlkit.nl.translate.Translation;
+          import com.google.mlkit.nl.translate.Translator;
+          import com.google.mlkit.nl.translate.TranslatorOptions;
+
+          import java.util.ArrayList;
+          import java.util.ArrayDeque;
+          import java.util.Deque;
+          import java.util.LinkedHashMap;
+          import java.util.Map;
+          import java.util.Locale;
+          import java.util.UUID;
+          import java.util.concurrent.ConcurrentLinkedQueue;
+          import java.util.concurrent.atomic.AtomicBoolean;
+          import java.io.BufferedReader;
+          import java.io.ByteArrayOutputStream;
+          import java.io.DataOutputStream;
+          import java.io.File;
+          import java.io.FileOutputStream;
+          import java.io.OutputStream;
+          import java.io.InputStream;
+          import java.io.InputStreamReader;
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.nio.charset.StandardCharsets;
+          import org.json.JSONArray;
+          import org.json.JSONObject;
+
+          public class MainActivity extends Activity {
+
+              private SpeechRecognizer recognizer;
+              private Intent speechIntent;
+              private boolean listening = false;
+              private boolean recognizerActive = false;
+              private boolean restartPending = false;
+              private int languageIndex = 0;
+              private int consecutiveRecognitionErrors = 0;
+              private final String[] speechLanguages = new String[]{"ar-KW", "ar-SA", "ar"};
+
+              private TextView arabicText;
+              private TextView chineseText;
+              private TextView statusText;
+              private Button startButton;
+
+              // V10 Free MyVoice：GPT-SoVITS 本人音色 + 手机系统TTS免费兜底
+              private SharedPreferences prefs;
+              private TextView voiceStatusText;
+              private Button recordVoiceButton;
+              private Button autoVoiceButton;
+              private MediaRecorder voiceRecorder;
+              private MediaPlayer voicePlayer;
+              private TextToSpeech systemTts;
+              private boolean systemTtsReady = false;
+              private File voiceSampleFile;
+              private boolean recordingVoice = false;
+              private boolean speakingVoice = false;
+              private boolean autoVoice = true;
+              private long voiceRecordStartedAt = 0L;
+              private String voiceServerUrl = "";
+              private String voiceRefPath = "";
+              private static final String VOICE_PROMPT =
+                      "你好，我正在测试自己的声音，希望翻译出来的中文听起来像我本人。";
+              private final ConcurrentLinkedQueue<String> voiceQueue = new ConcurrentLinkedQueue<>();
+              private final AtomicBoolean voiceBusy = new AtomicBoolean(false);
+
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              private Translator translator;
+              private boolean modelReady = false;
+              private boolean modelDownloading = false;
+
+              private final ConcurrentLinkedQueue<String> queue = new ConcurrentLinkedQueue<>();
+              private final AtomicBoolean translating = new AtomicBoolean(false);
+
+              // V8：最近上下文 + 防积压
+              private final Deque<String> recentArabic = new ArrayDeque<>();
+              private final Deque<String> recentChinese = new ArrayDeque<>();
+              private static final int MAX_CONTEXT = 3;
+              private static final int MAX_QUEUE = 2;
+
+              private final StringBuilder finalArabic = new StringBuilder();
+              private final StringBuilder finalChinese = new StringBuilder();
+              private String draftArabic = "";
+              private String draftChinese = "";
+              private String lastPartial = "";
+              private long lastPartialTranslateAt = 0L;
+              private int partialSeq = 0;
+
+              private String previousArabic = "";
+              private String previousChinese = "";
+
+              private final Map<String, String> phraseDict = new LinkedHashMap<>();
+              private final Map<String, String> termDict = new LinkedHashMap<>();
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+
+                  prefs = getSharedPreferences("myvoice_v10", MODE_PRIVATE);
+                  voiceServerUrl = prefs.getString("voice_server_url", "");
+                  voiceRefPath = prefs.getString("voice_ref_path", "");
+                  autoVoice = prefs.getBoolean("auto_voice", true);
+
+                  initDictionary();
+                  buildUi();
+                  setupTranslator();
+                  initSystemTts();
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(
+                              new String[]{Manifest.permission.RECORD_AUDIO},
+                              1001
+                      );
+                      statusText.setText("● 请先允许麦克风权限");
+                  } else {
+                      setupRecognizer();
+                  }
+              }
+
+              private void initDictionary() {
+                  // 高频口语短句
+                  phraseDict.put("وعليكم السلام", "也愿平安与你同在");
+                  phraseDict.put("صباح الخير", "早上好");
+                  phraseDict.put("مساء الخير", "晚上好");
+                  phraseDict.put("يسعدني المساعدة", "很高兴帮忙");
+                  phraseDict.put("يسرني المساعدة", "很高兴帮忙");
+                  phraseDict.put("لا تقلق", "别担心");
+                  phraseDict.put("لا داعي للعجلة", "不用着急");
+                  phraseDict.put("شكرا انا اقدر ذلك حقا", "谢谢，我真的很感激");
+                  phraseDict.put("شكرا أنا أقدر ذلك حقا", "谢谢，我真的很感激");
+                  phraseDict.put("هاتفي على وشك أن تنفد شحنته", "我的手机快没电了");
+                  phraseDict.put("هاتفي على وشك ان تنفد شحنته", "我的手机快没电了");
+
+                  // 领域与易错词
+                  termDict.put("شاحن", "充电器");
+                  termDict.put("شاحني", "我的充电器");
+                  termDict.put("هاتف", "手机");
+                  termDict.put("جوال", "手机");
+                  termDict.put("تلفون", "手机");
+                  termDict.put("بطارية", "电池");
+                  termDict.put("حفارة", "钻机");
+                  termDict.put("جهاز الحفر", "钻机");
+                  termDict.put("بئر", "井");
+                  termDict.put("آبار", "井");
+                  termDict.put("مناقصة", "招标");
+                  termDict.put("عطاء", "投标");
+                  termDict.put("عقد", "合同");
+                  termDict.put("عرض سعر", "报价");
+                  termDict.put("سعر", "价格");
+                  termDict.put("فاتورة", "发票");
+                  termDict.put("شركة", "公司");
+                  termDict.put("مشروع", "项目");
+                  termDict.put("صيانة", "维修");
+                  termDict.put("معدات", "设备");
+                  termDict.put("قطع غيار", "备件");
+                  termDict.put("أنابيب", "管材");
+                  termDict.put("أنبوب", "管");
+                  termDict.put("مضخة", "泵");
+                  termDict.put("ضغط", "压力");
+                  termDict.put("صمام", "阀门");
+                  termDict.put("نفط", "石油");
+                  termDict.put("غاز", "天然气");
+                  termDict.put("KOC", "KOC");
+                  termDict.put("كي او سي", "KOC");
+                  termDict.put("كويل تيوبينغ", "连续油管");
+                  termDict.put("كويل تيوبنج", "连续油管");
+                  termDict.put("ريج", "钻机");
+                  termDict.put("تندر", "招标");
+                  termDict.put("كونتراكت", "合同");
+                  termDict.put("كوتيشن", "报价");
+                  termDict.put("مود بمب", "泥浆泵");
+                  termDict.put("مضخة الطين", "泥浆泵");
+                  termDict.put("توب درايف", "顶驱");
+                  termDict.put("بي او بي", "BOP");
+                  termDict.put("مانع الانفجار", "BOP");
+                  termDict.put("كيسنغ", "套管");
+                  termDict.put("غلاف البئر", "套管");
+                  termDict.put("ويل هيد", "井口");
+                  termDict.put("رأس البئر", "井口");
+                  termDict.put("كومبليشن", "完井");
+                  termDict.put("وايرلاين", "电缆作业");
+                  termDict.put("لوقنغ", "测井");
+                  termDict.put("اي اس بي", "ESP");
+                  termDict.put("اس ار بي", "SRP");
+                  termDict.put("ستيميوليشن", "增产作业");
+                  termDict.put("موبلايزيشن", "动迁");
+                  termDict.put("ديموبلايزيشن", "撤场");
+                  termDict.put("ستاند باي", "待命");
+                  termDict.put("دي ريت", "日费");
+                  termDict.put("دفعة مقدمة", "预付款");
+                  termDict.put("شروط الدفع", "付款条件");
+                  termDict.put("مدة التسليم", "交货期");
+                  termDict.put("ضمان", "质保");
+                  termDict.put("تخليص جمركي", "清关");
+              }
+
+              private void buildUi() {
+                  ScrollView scroll = new ScrollView(this);
+
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(30, 40, 30, 40);
+                  root.setBackgroundColor(Color.rgb(245,245,245));
+                  scroll.addView(root);
+
+                  TextView title = new TextView(this);
+                  title.setText("阿语 → 中文 实时翻译 V10 · Free MyVoice");
+                  title.setTextSize(25);
+                  title.setTextColor(Color.BLACK);
+                  title.setGravity(Gravity.CENTER);
+                  title.setTypeface(null, 1);
+                  root.addView(title);
+
+                  TextView sub = new TextView(this);
+                  sub.setText("V8 翻译核心 + GPT-SoVITS 免费本人音色 + 系统TTS兜底");
+                  sub.setTextSize(14);
+                  sub.setGravity(Gravity.CENTER);
+                  sub.setPadding(0, 8, 0, 12);
+                  root.addView(sub);
+
+                  statusText = new TextView(this);
+                  statusText.setText("● 正在准备翻译模型");
+                  statusText.setTextSize(15);
+                  statusText.setGravity(Gravity.CENTER);
+                  statusText.setPadding(0,12,0,18);
+                  root.addView(statusText);
+
+                  startButton = new Button(this);
+                  startButton.setText("🎙 开始实时翻译");
+                  startButton.setTextSize(20);
+                  startButton.setAllCaps(false);
+                  startButton.setEnabled(false);
+                  startButton.setOnClickListener(v -> toggleListening());
+                  root.addView(startButton);
+
+                  voiceStatusText = new TextView(this);
+                  voiceStatusText.setText(customVoiceReady()
+                          ? "🔊 我的声音：GPT-SoVITS 已就绪"
+                          : "🔊 朗读模式：手机系统中文（免费兜底）");
+                  voiceStatusText.setTextSize(15);
+                  voiceStatusText.setPadding(0,18,0,8);
+                  root.addView(voiceStatusText);
+
+                  Button serverButton = new Button(this);
+                  serverButton.setText(voiceServerUrl.isEmpty()
+                          ? "① 设置免费语音服务器"
+                          : "① 免费语音服务器已设置");
+                  serverButton.setAllCaps(false);
+                  serverButton.setOnClickListener(v -> showVoiceServerDialog(serverButton));
+                  root.addView(serverButton);
+
+                  recordVoiceButton = new Button(this);
+                  recordVoiceButton.setText("② 录制我的声音（读指定句子 8–12 秒）");
+                  recordVoiceButton.setAllCaps(false);
+                  recordVoiceButton.setOnClickListener(v -> toggleVoiceRecording());
+                  root.addView(recordVoiceButton);
+
+                  autoVoiceButton = new Button(this);
+                  updateAutoVoiceButton();
+                  autoVoiceButton.setAllCaps(false);
+                  autoVoiceButton.setOnClickListener(v -> {
+                      autoVoice = !autoVoice;
+                      prefs.edit().putBoolean("auto_voice", autoVoice).apply();
+                      updateAutoVoiceButton();
+                  });
+                  root.addView(autoVoiceButton);
+
+                  Button testVoiceButton = new Button(this);
+                  testVoiceButton.setText("④ 测试中文朗读");
+                  testVoiceButton.setAllCaps(false);
+                  testVoiceButton.setOnClickListener(v -> enqueueMyVoice("你好，这是我的声音测试。"));
+                  root.addView(testVoiceButton);
+
+                  TextView arLabel = new TextView(this);
+                  arLabel.setText("阿语原文");
+                  arLabel.setTextSize(16);
+                  arLabel.setPadding(0,25,0,8);
+                  root.addView(arLabel);
+
+                  arabicText = new TextView(this);
+                  arabicText.setText("等待对方说阿拉伯语……");
+                  arabicText.setTextSize(20);
+                  arabicText.setPadding(22,22,22,22);
+                  arabicText.setBackgroundColor(Color.WHITE);
+                  arabicText.setMinHeight(230);
+                  arabicText.setGravity(Gravity.RIGHT);
+                  root.addView(arabicText);
+
+                  TextView zhLabel = new TextView(this);
+                  zhLabel.setText("中文翻译");
+                  zhLabel.setTextSize(16);
+                  zhLabel.setPadding(0,25,0,8);
+                  root.addView(zhLabel);
+
+                  chineseText = new TextView(this);
+                  chineseText.setText("中文会自动显示在这里。");
+                  chineseText.setTextSize(20);
+                  chineseText.setPadding(22,22,22,22);
+                  chineseText.setBackgroundColor(Color.WHITE);
+                  chineseText.setMinHeight(230);
+                  chineseText.setTextIsSelectable(true);
+                  root.addView(chineseText);
+
+                  Button clear = new Button(this);
+                  clear.setText("清空");
+                  clear.setOnClickListener(v -> {
+                      finalArabic.setLength(0);
+                      finalChinese.setLength(0);
+                      draftArabic = "";
+                      draftChinese = "";
+                      lastPartial = "";
+                      recentArabic.clear();
+                      recentChinese.clear();
+                      queue.clear();
+                      renderArabic();
+                      renderChinese();
+                  });
+                  root.addView(clear);
+
+                  Button redownload = new Button(this);
+                  redownload.setText("重新准备翻译模型");
+                  redownload.setOnClickListener(v -> prepareModel());
+                  root.addView(redownload);
+
+                  setContentView(scroll);
+              }
+
+              private interface OnlineCallback {
+                  void done(String result, boolean online);
+              }
+
+              private String urlEncode(String s) throws Exception {
+                  return java.net.URLEncoder.encode(s, "UTF-8");
+              }
+
+              private void rememberContext(String ar, String zh) {
+                  if (ar != null && !ar.trim().isEmpty()) {
+                      recentArabic.addLast(ar.trim());
+                      while (recentArabic.size() > MAX_CONTEXT) recentArabic.removeFirst();
+                  }
+                  if (zh != null && !zh.trim().isEmpty()) {
+                      recentChinese.addLast(zh.trim());
+                      while (recentChinese.size() > MAX_CONTEXT) recentChinese.removeFirst();
+                  }
+              }
+
+              private String buildContextText() {
+                  StringBuilder sb = new StringBuilder();
+                  int i = 1;
+                  for (String s : recentArabic) {
+                      if (sb.length() > 0) sb.append(" | ");
+                      sb.append(i++).append(":").append(s);
+                  }
+                  return sb.toString();
+              }
+
+              private boolean isLikelyDuplicate(String s) {
+                  if (s == null || s.trim().isEmpty()) return true;
+                  String norm = normalizeArabic(s);
+                  String all = normalizeArabic(finalArabic.toString());
+                  if (all.isEmpty()) return false;
+                  String[] parts = all.split("\\n\\n");
+                  String last = parts.length == 0 ? all : parts[parts.length - 1].trim();
+                  return norm.equals(last);
+              }
+
+              private void enqueueLatest(String ar) {
+                  if (ar == null || ar.trim().isEmpty()) return;
+                  while (queue.size() >= MAX_QUEUE) queue.poll();
+                  queue.add(ar.trim());
+                  processQueue();
+              }
+
+              private void onlineTranslate(String arabic, String localChinese, OnlineCallback cb) {
+                  final String current = arabic == null ? "" : arabic.trim();
+                  final String context = buildContextText();
+
+                  new Thread(() -> {
+                      String result = localChinese;
+                      boolean onlineOk = false;
+                      HttpURLConnection conn = null;
+                      try {
+                          String payload = context.isEmpty()
+                                  ? current
+                                  : "السياق السابق: [" + context + "] الجملة الحالية فقط: " + current;
+
+                          String q = urlEncode(payload);
+                          URL url = new URL(
+                                  "https://translate.googleapis.com/translate_a/single"
+                                  + "?client=gtx&sl=ar&tl=zh-CN&dt=t&q=" + q
+                          );
+                          conn = (HttpURLConnection) url.openConnection();
+                          conn.setRequestMethod("GET");
+                          conn.setConnectTimeout(1800);
+                          conn.setReadTimeout(2600);
+                          conn.setRequestProperty("User-Agent", "Mozilla/5.0");
+
+                          int code = conn.getResponseCode();
+                          if (code >= 200 && code < 300) {
+                              StringBuilder sb = new StringBuilder();
+                              try (BufferedReader br = new BufferedReader(
+                                      new InputStreamReader(conn.getInputStream(), StandardCharsets.UTF_8))) {
+                                  String line;
+                                  while ((line = br.readLine()) != null) sb.append(line);
+                              }
+
+                              JSONArray root = new JSONArray(sb.toString());
+                              JSONArray parts = root.getJSONArray(0);
+                              StringBuilder zh = new StringBuilder();
+                              for (int i = 0; i < parts.length(); i++) {
+                                  JSONArray seg = parts.optJSONArray(i);
+                                  if (seg != null && seg.length() > 0) zh.append(seg.optString(0, ""));
+                              }
+
+                              String all = zh.toString().trim();
+                              int marker = all.lastIndexOf("当前句");
+                              if (marker >= 0) {
+                                  all = all.substring(marker + 3).replace("：", "").replace(":", "").trim();
+                              }
+                              if (!all.isEmpty()) {
+                                  result = smartPostCorrect(current, all);
+                                  onlineOk = true;
+                              }
+                          }
+                      } catch (Exception ignored) {
+                      } finally {
+                          if (conn != null) conn.disconnect();
+                      }
+
+                      final String out = result;
+                      final boolean ok = onlineOk;
+                      runOnUiThread(() -> cb.done(out, ok));
+                  }).start();
+              }
+
+              private void setupTranslator() {
+                  TranslatorOptions options =
+                          new TranslatorOptions.Builder()
+                                  .setSourceLanguage(TranslateLanguage.ARABIC)
+                                  .setTargetLanguage(TranslateLanguage.CHINESE)
+                                  .build();
+
+                  translator = Translation.getClient(options);
+                  prepareModel();
+              }
+
+              private void prepareModel() {
+                  if (translator == null || modelDownloading) return;
+
+                  modelDownloading = true;
+                  modelReady = false;
+                  statusText.setText("● 正在准备本地备用翻译模型…");
+
+                  DownloadConditions conditions =
+                          new DownloadConditions.Builder().build();
+
+                  translator.downloadModelIfNeeded(conditions)
+                          .addOnSuccessListener(unused -> {
+                              modelDownloading = false;
+                              modelReady = true;
+                              if (recognizer != null || SpeechRecognizer.isRecognitionAvailable(this)) {
+                                  startButton.setEnabled(true);
+                              }
+                              statusText.setText("● 本地备用翻译已就绪");
+                              Toast.makeText(
+                                      this,
+                                      "V8 本地备用模型准备完成",
+                                      Toast.LENGTH_SHORT
+                              ).show();
+                          })
+                          .addOnFailureListener(e -> {
+                              modelDownloading = false;
+                              modelReady = false;
+                              // 在线翻译仍可工作，不阻止语音识别
+                              if (SpeechRecognizer.isRecognitionAvailable(this)) {
+                                  startButton.setEnabled(true);
+                              }
+                              statusText.setText("● 本地备用模型未就绪；仍可使用在线翻译");
+                          });
+              }
+
+              @Override
+              public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                  if (requestCode == 1001) {
+                      if (grantResults.length > 0 && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                          setupRecognizer();
+                          statusText.setText("● 麦克风已授权，语音识别就绪");
+                      } else {
+                          statusText.setText("● 未获得麦克风权限，无法识别语音");
+                          startButton.setEnabled(false);
+                      }
+                  }
+              }
+
+              private void setupRecognizer() {
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      statusText.setText("本机没有可用语音识别服务");
+                      return;
+                  }
+
+                  try {
+                      recognizer = SpeechRecognizer.createSpeechRecognizer(this);
+                  } catch (Exception e) {
+                      recognizer = null;
+                      statusText.setText("● 无法创建系统语音识别器");
+                      startButton.setEnabled(false);
+                      return;
+                  }
+
+                  recognizer.setRecognitionListener(new RecognitionListener() {
+                      public void onReadyForSpeech(Bundle params) {
+                          recognizerActive = true;
+                          restartPending = false;
+                          consecutiveRecognitionErrors = 0;
+                          statusText.setText("● 正在听阿语 (" + speechLanguages[languageIndex] + ")");
+                      }
+
+                      public void onBeginningOfSpeech() {
+                          recognizerActive = true;
+                          statusText.setText("● 对方正在说话");
+                      }
+
+                      public void onRmsChanged(float rmsdB) {}
+                      public void onBufferReceived(byte[] buffer) {}
+
+                      public void onEndOfSpeech() {
+                          // 不在这里重启。等待 onResults / onError，避免三星设备上重复 startListening。
+                          statusText.setText("● 正在整理识别结果");
+                      }
+
+                      public void onError(int error) {
+                          if (recordingVoice || speakingVoice) {
+                              recognizerActive = false;
+                              restartPending = false;
+                              return;
+                          }
+                          recognizerActive = false;
+                          restartPending = false;
+                          consecutiveRecognitionErrors++;
+
+                          String msg;
+                          switch (error) {
+                              case SpeechRecognizer.ERROR_AUDIO: msg = "音频错误"; break;
+                              case SpeechRecognizer.ERROR_CLIENT: msg = "识别服务正在重置"; break;
+                              case SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS: msg = "没有麦克风权限"; break;
+                              case SpeechRecognizer.ERROR_NETWORK: msg = "语音识别网络错误"; break;
+                              case SpeechRecognizer.ERROR_NETWORK_TIMEOUT: msg = "语音识别网络超时"; break;
+                              case SpeechRecognizer.ERROR_NO_MATCH: msg = "没听清，继续监听"; break;
+                              case SpeechRecognizer.ERROR_RECOGNIZER_BUSY: msg = "识别器忙，正在恢复"; break;
+                              case SpeechRecognizer.ERROR_SERVER: msg = "系统语音服务错误"; break;
+                              case SpeechRecognizer.ERROR_SPEECH_TIMEOUT: msg = "等待你说阿语"; break;
+                              default: msg = "语音识别错误 " + error;
+                          }
+
+                          // Android 12+：12/13 常见于指定方言不可用，自动 ar-KW -> ar-SA -> ar
+                          if ((error == 12 || error == 13) && languageIndex < speechLanguages.length - 1) {
+                              languageIndex++;
+                              updateSpeechLanguage();
+                              msg = "切换阿语识别模式：" + speechLanguages[languageIndex];
+                          } else if (consecutiveRecognitionErrors >= 4 && languageIndex < speechLanguages.length - 1) {
+                              languageIndex++;
+                              consecutiveRecognitionErrors = 0;
+                              updateSpeechLanguage();
+                              msg = "自动切换阿语识别模式：" + speechLanguages[languageIndex];
+                          }
+
+                          statusText.setText("● " + msg);
+
+                          if (listening && !recordingVoice && !speakingVoice
+                                  && error != SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS) {
+                              long delay = (error == SpeechRecognizer.ERROR_RECOGNIZER_BUSY
+                                      || error == SpeechRecognizer.ERROR_CLIENT) ? 900L : 450L;
+                              scheduleRecognitionRestart(delay);
+                          }
+                      }
+
+                      public void onResults(Bundle results) {
+                          if (recordingVoice || speakingVoice) {
+                              recognizerActive = false;
+                              restartPending = false;
+                              return;
+                          }
+                          recognizerActive = false;
+                          restartPending = false;
+                          consecutiveRecognitionErrors = 0;
+
+                          ArrayList<String> list =
+                                  results.getStringArrayList(
+                                          SpeechRecognizer.RESULTS_RECOGNITION
+                                  );
+
+                          String ar = "";
+                          if (list != null && !list.isEmpty()) {
+                              ar = list.get(0).trim();
+                          }
+
+                          String partial = lastPartial == null ? "" : lastPartial.trim();
+                          if (!partial.isEmpty() && !ar.isEmpty()) {
+                              String na = normalizeArabic(ar);
+                              String np = normalizeArabic(partial);
+                              if (np.contains(na) && partial.length() >= ar.length() + 6) {
+                                  ar = partial;
+                              }
+                          } else if (ar.isEmpty() && !partial.isEmpty()) {
+                              ar = partial;
+                          }
+
+                          if (!ar.isEmpty() && !isLikelyDuplicate(ar)) {
+                              commitArabic(ar);
+                              draftArabic = "";
+                              draftChinese = "";
+                              lastPartial = "";
+                              renderArabic();
+                              renderChinese();
+                              enqueueLatest(ar);
+                          }
+
+                          if (listening && !recordingVoice && !speakingVoice) {
+                              scheduleRecognitionRestart(260L);
+                          }
+                      }
+
+                      public void onPartialResults(Bundle partialResults) {
+                          ArrayList<String> list =
+                                  partialResults.getStringArrayList(
+                                          SpeechRecognizer.RESULTS_RECOGNITION
+                                  );
+
+                          if (list != null && !list.isEmpty()) {
+                              String p = list.get(0).trim();
+                              if (!p.isEmpty()) {
+                                  lastPartial = p;
+                                  draftArabic = p;
+                                  renderArabic();
+                                  statusText.setText("● 正在听： " + p);
+
+                                  long now = System.currentTimeMillis();
+                                  if (now - lastPartialTranslateAt >= 450) {
+                                      lastPartialTranslateAt = now;
+                                      translatePartial(p);
+                                  }
+                              }
+                          }
+                      }
+
+                      public void onEvent(int eventType, Bundle params) {}
+                  });
+
+                  speechIntent =
+                          new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+
+                  speechIntent.putExtra(
+                          RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                          RecognizerIntent.LANGUAGE_MODEL_FREE_FORM
+                  );
+
+                  updateSpeechLanguage();
+
+                  speechIntent.putExtra(
+                          RecognizerIntent.EXTRA_PARTIAL_RESULTS,
+                          true
+                  );
+
+                  speechIntent.putExtra(
+                          RecognizerIntent.EXTRA_MAX_RESULTS,
+                          5
+                  );
+
+                  speechIntent.putExtra(
+                          RecognizerIntent.EXTRA_CALLING_PACKAGE,
+                          getPackageName()
+                  );
+                  speechIntent.putExtra(
+                          RecognizerIntent.EXTRA_PREFER_OFFLINE,
+                          false
+                  );
+
+                  startButton.setEnabled(true);
+                  if (!modelDownloading) {
+                      statusText.setText("● 阿语语音识别已就绪");
+                  }
+
+
+              }
+
+              private void updateSpeechLanguage() {
+                  if (speechIntent == null) return;
+                  String lang = speechLanguages[Math.max(0, Math.min(languageIndex, speechLanguages.length - 1))];
+                  speechIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, lang);
+                  speechIntent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_PREFERENCE, lang);
+              }
+
+              private void scheduleRecognitionRestart(long delayMs) {
+                  if (!listening || restartPending || recordingVoice || speakingVoice) return;
+                  restartPending = true;
+                  handler.postDelayed(() -> {
+                      restartPending = false;
+                      startRecognition();
+                  }, delayMs);
+              }
+
+              private void toggleListening() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1001);
+                      statusText.setText("● 请允许麦克风权限");
+                      return;
+                  }
+
+                  if (recognizer == null) {
+                      setupRecognizer();
+                  }
+
+                  if (!listening) {
+                      listening = true;
+                      recognizerActive = false;
+                      restartPending = false;
+                      consecutiveRecognitionErrors = 0;
+                      languageIndex = 0;
+                      updateSpeechLanguage();
+                      startButton.setText("■ 停止翻译");
+                      statusText.setText("● 正在启动阿语识别…");
+                      startRecognition();
+                  } else {
+                      listening = false;
+                      restartPending = false;
+                      recognizerActive = false;
+                      handler.removeCallbacksAndMessages(null);
+                      startButton.setText("🎙 开始实时翻译");
+                      statusText.setText("● 已停止");
+                      try {
+                          if (recognizer != null) recognizer.cancel();
+                      } catch (Exception ignored) {}
+                  }
+              }
+
+              private void startRecognition() {
+                  if (!listening || recognizer == null || recognizerActive || recordingVoice || speakingVoice) return;
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      statusText.setText("● 请允许麦克风权限");
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1001);
+                      return;
+                  }
+
+                  try {
+                      updateSpeechLanguage();
+                      recognizer.startListening(speechIntent);
+                      recognizerActive = true;
+                      statusText.setText("● 正在连接阿语识别 (" + speechLanguages[languageIndex] + ")");
+                  } catch (Exception e) {
+                      recognizerActive = false;
+                      statusText.setText("● 启动语音识别失败，正在重试");
+                      scheduleRecognitionRestart(900L);
+                  }
+              }
+
+              private void commitArabic(String s) {
+                  if (s == null || s.trim().isEmpty()) return;
+                  if (finalArabic.length() > 0) finalArabic.append("\n\n");
+                  finalArabic.append(s.trim());
+              }
+
+              private void appendChinese(String s) {
+                  if (s == null || s.trim().isEmpty()) return;
+                  if (finalChinese.length() > 0) finalChinese.append("\n\n");
+                  finalChinese.append(s.trim());
+                  draftChinese = "";
+                  renderChinese();
+
+                  if (!s.startsWith("[") && autoVoice) {
+                      enqueueMyVoice(s.trim());
+                  }
+              }
+
+              private void renderArabic() {
+                  StringBuilder out = new StringBuilder(finalArabic);
+                  if (draftArabic != null && !draftArabic.isEmpty()) {
+                      if (out.length() > 0) out.append("\n\n");
+                      out.append(draftArabic);
+                  }
+                  if (out.length() == 0) {
+                      arabicText.setText("等待对方说阿拉伯语……");
+                  } else {
+                      arabicText.setText(out.toString());
+                  }
+              }
+
+              private void renderChinese() {
+                  StringBuilder out = new StringBuilder(finalChinese);
+                  if (draftChinese != null && !draftChinese.isEmpty()) {
+                      if (out.length() > 0) out.append("\n\n");
+                      out.append(draftChinese);
+                  }
+                  if (out.length() == 0) {
+                      chineseText.setText("中文会自动显示在这里。");
+                  } else {
+                      chineseText.setText(out.toString());
+                  }
+              }
+
+              private void translatePartial(String text) {
+                  // V8：partial 只显示阿语字幕；中文只在一句结束后稳定输出。
+                  draftChinese = "";
+                  renderChinese();
+              }
+
+              private String normalizeArabic(String s) {
+                  return s
+                          .replace("أ", "ا")
+                          .replace("إ", "ا")
+                          .replace("آ", "ا")
+                          .replace("ى", "ي")
+                          .replace("ة", "ه")
+                          .replaceAll("[\\u064B-\\u065F]", "")
+                          .trim();
+              }
+
+              private String exactPhraseHit(String arabic) {
+                  String norm = normalizeArabic(arabic);
+
+                  for (Map.Entry<String, String> e : phraseDict.entrySet()) {
+                      String k = normalizeArabic(e.getKey());
+                      if (norm.equals(k)) {
+                          return e.getValue();
+                      }
+                  }
+
+                  return null;
+              }
+
+              private String smartPostCorrect(String arabic, String translated) {
+                  String result = translated;
+                  String norm = normalizeArabic(arabic);
+
+                  // 充电器歧义：优先纠正“卡车/货车”
+                  if (norm.contains("شاحن") || norm.contains("شاحني")) {
+                      result = result.replace("卡车", "充电器");
+                      result = result.replace("货车", "充电器");
+                      result = result.replace("货运车", "充电器");
+                      result = result.replace("充电车", "充电器");
+                  }
+
+                  if (norm.contains("استعار") || norm.contains("استعاره")) {
+                      result = result.replace("贷款", "借一个");
+                      result = result.replace("借款", "借一个");
+                      result = result.replace("借贷", "借一个");
+                  }
+
+                  if (norm.contains("لهذه الليله") || norm.contains("لهذه الليلة")) {
+                      result = result.replace("这个夜晚", "今晚");
+                      result = result.replace("这一夜", "今晚");
+                  }
+
+                  if (norm.contains("لدي واحد اضافي") || norm.contains("لدي واحد إضافي")) {
+                      result = result.replace("额外的一个", "一个备用的");
+                      result = result.replace("多余的一个", "一个备用的");
+                  }
+
+                  // 专业术语后处理
+                  if (norm.contains("حفار") || norm.contains("جهاز الحفر") || norm.contains("ريج")) {
+                      result = result.replace("挖掘机", "钻机");
+                      result = result.replace("钻孔机", "钻机");
+                  }
+
+                  if (norm.contains("كويل") || norm.contains("تيوب")) {
+                      result = result.replace("盘管", "连续油管");
+                      result = result.replace("线圈管", "连续油管");
+                  }
+
+
+                  if ((norm.contains("هاتف") || norm.contains("جوال") || norm.contains("تلفون"))
+                          && result.contains("电话")) {
+                      result = result.replace("电话", "手机");
+                  }
+                  if (norm.contains("موبلايزيشن")) {
+                      result = result.replace("动员", "动迁").replace("调动", "动迁");
+                  }
+                  if (norm.contains("ستاند باي")) {
+                      result = result.replace("站立", "待命").replace("备用", "待命");
+                  }
+                  if (norm.contains("دي ريت")) {
+                      result = result.replace("日率", "日费").replace("每日费率", "日费");
+                  }
+                  if (norm.contains("شروط الدفع")) {
+                      result = result.replace("支付条款", "付款条件");
+                  }
+                  if (norm.contains("مدة التسليم")) {
+                      result = result.replace("交付时间", "交货期");
+                  }
+
+                  if (norm.contains("مناقصة") || norm.contains("عطاء") || norm.contains("تندر")) {
+                      result = result.replace("拍卖", "招标");
+                      result = result.replace("报价单", "投标");
+                  }
+
+                  if (norm.contains("عرض سعر") || norm.contains("كوتيشن")) {
+                      result = result.replace("价格展示", "报价");
+                      result = result.replace("价格报价", "报价");
+                  }
+
+                  return result;
+              }
+
+              private void updateAutoVoiceButton() {
+                  if (autoVoiceButton != null) {
+                      autoVoiceButton.setText(autoVoice
+                              ? "③ 自动朗读中文：开"
+                              : "③ 自动朗读中文：关");
+                  }
+              }
+
+              private void initSystemTts() {
+                  systemTts = new TextToSpeech(this, status -> {
+                      if (status == TextToSpeech.SUCCESS) {
+                          int r = systemTts.setLanguage(Locale.CHINA);
+                          systemTts.setSpeechRate(1.0f);
+                          systemTts.setPitch(1.0f);
+                          systemTtsReady = r != TextToSpeech.LANG_MISSING_DATA
+                                  && r != TextToSpeech.LANG_NOT_SUPPORTED;
+                          systemTts.setOnUtteranceProgressListener(new UtteranceProgressListener() {
+                              @Override
+                              public void onStart(String utteranceId) {}
+
+                              @Override
+                              public void onDone(String utteranceId) {
+                                  runOnUiThread(() -> finishVoicePlayback(
+                                          "✅ 系统中文朗读已就绪"
+                                  ));
+                              }
+
+                              @Override
+                              public void onError(String utteranceId) {
+                                  runOnUiThread(() -> finishVoicePlayback("⚠ 系统中文朗读失败"));
+                              }
+                          });
+                      } else {
+                          systemTtsReady = false;
+                      }
+                  });
+              }
+
+              private boolean customVoiceReady() {
+                  return voiceServerUrl != null && !voiceServerUrl.trim().isEmpty()
+                          && voiceRefPath != null && !voiceRefPath.trim().isEmpty();
+              }
+
+              private String normalizeServerUrl(String s) {
+                  if (s == null) return "";
+                  s = s.trim();
+                  while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
+                  return s;
+              }
+
+              private void showVoiceServerDialog(Button serverButton) {
+                  EditText input = new EditText(this);
+                  input.setHint("例如：http://192.168.1.100:9879");
+                  input.setSingleLine(true);
+                  if (!voiceServerUrl.isEmpty()) input.setText(voiceServerUrl);
+
+                  new AlertDialog.Builder(this)
+                          .setTitle("GPT-SoVITS 免费语音服务器")
+                          .setMessage("电脑运行 GPT-SoVITS + MyVoice Gateway 后，填入电脑局域网地址。"
+                                  + "没有服务器也能用，App 会自动使用手机系统中文朗读。")
+                          .setView(input)
+                          .setPositiveButton("保存并检测", (d, w) -> {
+                              voiceServerUrl = normalizeServerUrl(input.getText().toString());
+                              prefs.edit()
+                                      .putString("voice_server_url", voiceServerUrl)
+                                      .remove("voice_ref_path")
+                                      .apply();
+                              voiceRefPath = "";
+                              serverButton.setText(voiceServerUrl.isEmpty()
+                                      ? "① 设置免费语音服务器"
+                                      : "① 免费语音服务器已设置");
+                              if (voiceServerUrl.isEmpty()) {
+                                  voiceStatusText.setText("🔊 朗读模式：手机系统中文（免费兜底）");
+                              } else {
+                                  checkVoiceServer();
+                              }
+                          })
+                          .setNegativeButton("取消", null)
+                          .show();
+              }
+
+              private void checkVoiceServer() {
+                  if (voiceServerUrl.isEmpty()) return;
+                  voiceStatusText.setText("⏳ 正在检测免费语音服务器…");
+                  new Thread(() -> {
+                      HttpURLConnection conn = null;
+                      try {
+                          URL url = new URL(voiceServerUrl + "/health");
+                          conn = (HttpURLConnection) url.openConnection();
+                          conn.setRequestMethod("GET");
+                          conn.setConnectTimeout(3500);
+                          conn.setReadTimeout(3500);
+                          int code = conn.getResponseCode();
+                          if (code >= 200 && code < 300) {
+                              runOnUiThread(() -> voiceStatusText.setText(
+                                      customVoiceReady()
+                                              ? "✅ 我的声音：GPT-SoVITS 已就绪"
+                                              : "✅ 服务器已连接，请录制本人声音"
+                              ));
+                          } else {
+                              throw new Exception("HTTP " + code);
+                          }
+                      } catch (Exception e) {
+                          runOnUiThread(() -> voiceStatusText.setText(
+                                  "⚠ 服务器暂不可用，已自动使用手机系统中文朗读"
+                          ));
+                      } finally {
+                          if (conn != null) conn.disconnect();
+                      }
+                  }).start();
+              }
+
+              private void toggleVoiceRecording() {
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO)
+                          != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(new String[]{Manifest.permission.RECORD_AUDIO}, 1001);
+                      return;
+                  }
+
+                  if (voiceServerUrl.isEmpty()) {
+                      Toast.makeText(this,
+                              "先设置免费语音服务器；不设置也可以直接用系统中文朗读",
+                              Toast.LENGTH_LONG).show();
+                      return;
+                  }
+
+                  if (!recordingVoice) {
+                      new AlertDialog.Builder(this)
+                              .setTitle("请照着读 8–12 秒")
+                              .setMessage(VOICE_PROMPT + "\n\n点击“开始”后自然朗读，读完再点停止。")
+                              .setPositiveButton("开始", (d, w) -> startVoiceRecording())
+                              .setNegativeButton("取消", null)
+                              .show();
+                  } else {
+                      stopVoiceRecordingAndUpload();
+                  }
+              }
+
+              private void startVoiceRecording() {
+                  try {
+                      if (recognizer != null) {
+                          try { recognizer.cancel(); } catch (Exception ignored) {}
+                          recognizerActive = false;
+                      }
+                      restartPending = false;
+
+                      voiceSampleFile = new File(getCacheDir(), "my_voice_sample.m4a");
+                      if (voiceSampleFile.exists()) voiceSampleFile.delete();
+
+                      voiceRecorder = new MediaRecorder();
+                      voiceRecorder.setAudioSource(MediaRecorder.AudioSource.MIC);
+                      voiceRecorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4);
+                      voiceRecorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC);
+                      voiceRecorder.setAudioEncodingBitRate(128000);
+                      voiceRecorder.setAudioSamplingRate(44100);
+                      voiceRecorder.setOutputFile(voiceSampleFile.getAbsolutePath());
+                      voiceRecorder.prepare();
+                      voiceRecorder.start();
+
+                      recordingVoice = true;
+                      voiceRecordStartedAt = System.currentTimeMillis();
+                      recordVoiceButton.setText("■ 停止录音并上传到我的电脑");
+                      voiceStatusText.setText("🎙 正在录：请读——" + VOICE_PROMPT);
+                      statusText.setText("● 正在录制本人音色样本");
+                  } catch (Exception e) {
+                      recordingVoice = false;
+                      voiceStatusText.setText("录音启动失败：" + e.getMessage());
+                      try { if (voiceRecorder != null) voiceRecorder.release(); } catch (Exception ignored) {}
+                      voiceRecorder = null;
+                  }
+              }
+
+              private void stopVoiceRecordingAndUpload() {
+                  long seconds = Math.max(0L,
+                          (System.currentTimeMillis() - voiceRecordStartedAt) / 1000L);
+                  try {
+                      if (voiceRecorder != null) {
+                          voiceRecorder.stop();
+                          voiceRecorder.release();
+                      }
+                  } catch (Exception e) {
+                      Toast.makeText(this, "录音太短，请重新录制", Toast.LENGTH_LONG).show();
+                  }
+                  voiceRecorder = null;
+                  recordingVoice = false;
+                  recordVoiceButton.setText("② 重新录制我的声音");
+
+                  if (voiceSampleFile == null || !voiceSampleFile.exists()
+                          || voiceSampleFile.length() < 1000) {
+                      voiceStatusText.setText("录音无效，请重新录制");
+                      if (listening) scheduleRecognitionRestart(400L);
+                      return;
+                  }
+
+                  if (seconds < 4) {
+                      Toast.makeText(this,
+                              "录音只有 " + seconds + " 秒，建议重新录 8–12 秒",
+                              Toast.LENGTH_LONG).show();
+                  }
+
+                  voiceStatusText.setText("⏳ 正在把声音样本上传到你的免费语音服务器…");
+                  uploadVoiceSample(voiceSampleFile);
+              }
+
+              private void uploadVoiceSample(File audioFile) {
+                  new Thread(() -> {
+                      HttpURLConnection conn = null;
+                      try {
+                          String boundary = "----FreeMyVoice" + System.currentTimeMillis();
+                          URL url = new URL(voiceServerUrl + "/upload_ref");
+                          conn = (HttpURLConnection) url.openConnection();
+                          conn.setRequestMethod("POST");
+                          conn.setConnectTimeout(10000);
+                          conn.setReadTimeout(60000);
+                          conn.setDoOutput(true);
+                          conn.setRequestProperty(
+                                  "Content-Type", "multipart/form-data; boundary=" + boundary);
+
+                          try (DataOutputStream out =
+                                       new DataOutputStream(conn.getOutputStream())) {
+                              writeFormField(out, boundary, "prompt_text", VOICE_PROMPT);
+                              out.writeBytes("--" + boundary + "\r\n");
+                              out.writeBytes(
+                                      "Content-Disposition: form-data; name=\"file\"; "
+                                              + "filename=\"my_voice_sample.m4a\"\r\n");
+                              out.writeBytes("Content-Type: audio/mp4\r\n\r\n");
+                              try (InputStream fis =
+                                           new java.io.FileInputStream(audioFile)) {
+                                  byte[] buf = new byte[8192];
+                                  int n;
+                                  while ((n = fis.read(buf)) >= 0) out.write(buf, 0, n);
+                              }
+                              out.writeBytes("\r\n--" + boundary + "--\r\n");
+                              out.flush();
+                          }
+
+                          int code = conn.getResponseCode();
+                          InputStream is = code >= 200 && code < 300
+                                  ? conn.getInputStream() : conn.getErrorStream();
+                          String body = readAllText(is);
+                          if (code >= 200 && code < 300) {
+                              String ref = new JSONObject(body)
+                                      .optString("ref_audio_path", "");
+                              if (ref.isEmpty()) {
+                                  throw new Exception("服务器没有返回 ref_audio_path");
+                              }
+                              voiceRefPath = ref;
+                              prefs.edit().putString("voice_ref_path", ref).apply();
+                              runOnUiThread(() -> {
+                                  voiceStatusText.setText(
+                                          "✅ 我的声音已就绪，翻译后会自动用本人音色朗读");
+                                  Toast.makeText(this,
+                                          "本人音色设置成功",
+                                          Toast.LENGTH_LONG).show();
+                                  if (listening) scheduleRecognitionRestart(450L);
+                              });
+                          } else {
+                              throw new Exception("HTTP " + code + " " + body);
+                          }
+                      } catch (Exception e) {
+                          String msg = e.getMessage() == null
+                                  ? e.toString() : e.getMessage();
+                          runOnUiThread(() -> {
+                              voiceStatusText.setText(
+                                      "⚠ 上传失败：" + msg + "；仍可使用系统中文朗读");
+                              if (listening) scheduleRecognitionRestart(450L);
+                          });
+                      } finally {
+                          if (conn != null) conn.disconnect();
+                      }
+                  }).start();
+              }
+
+              private void writeFormField(DataOutputStream out, String boundary,
+                                          String name, String value) throws Exception {
+                  out.writeBytes("--" + boundary + "\r\n");
+                  out.writeBytes(
+                          "Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n");
+                  out.write(value.getBytes(StandardCharsets.UTF_8));
+                  out.writeBytes("\r\n");
+              }
+
+              private String readAllText(InputStream is) throws Exception {
+                  if (is == null) return "";
+                  StringBuilder sb = new StringBuilder();
+                  try (BufferedReader br = new BufferedReader(
+                          new InputStreamReader(is, StandardCharsets.UTF_8))) {
+                      String line;
+                      while ((line = br.readLine()) != null) sb.append(line);
+                  }
+                  return sb.toString();
+              }
+
+              private void enqueueMyVoice(String chinese) {
+                  if (chinese == null || chinese.trim().isEmpty()) return;
+                  while (voiceQueue.size() >= 3) voiceQueue.poll();
+                  voiceQueue.offer(chinese.trim());
+                  synthesizeNextMyVoice();
+              }
+
+              private void synthesizeNextMyVoice() {
+                  if (!voiceBusy.compareAndSet(false, true)) return;
+                  String text = voiceQueue.poll();
+                  if (text == null) {
+                      voiceBusy.set(false);
+                      return;
+                  }
+
+                  if (customVoiceReady()) {
+                      requestCustomVoice(text);
+                  } else {
+                      speakSystemVoice(text);
+                  }
+              }
+
+              private void requestCustomVoice(String text) {
+                  new Thread(() -> {
+                      HttpURLConnection conn = null;
+                      try {
+                          URL url = new URL(voiceServerUrl + "/tts");
+                          conn = (HttpURLConnection) url.openConnection();
+                          conn.setRequestMethod("POST");
+                          conn.setConnectTimeout(7000);
+                          conn.setReadTimeout(120000);
+                          conn.setDoOutput(true);
+                          conn.setRequestProperty(
+                                  "Content-Type", "application/json; charset=UTF-8");
+
+                          JSONObject body = new JSONObject();
+                          body.put("text", text);
+                          body.put("ref_audio_path", voiceRefPath);
+                          body.put("prompt_text", VOICE_PROMPT);
+
+                          try (OutputStream os = conn.getOutputStream()) {
+                              os.write(body.toString().getBytes(StandardCharsets.UTF_8));
+                          }
+
+                          int code = conn.getResponseCode();
+                          if (code < 200 || code >= 300) {
+                              String err = readAllText(conn.getErrorStream());
+                              throw new Exception("HTTP " + code + " " + err);
+                          }
+
+                          File wav = new File(
+                                  getCacheDir(),
+                                  "myvoice_" + System.currentTimeMillis() + ".wav");
+                          try (InputStream in = conn.getInputStream();
+                               FileOutputStream fos = new FileOutputStream(wav)) {
+                              byte[] buf = new byte[8192];
+                              int n;
+                              while ((n = in.read(buf)) >= 0) fos.write(buf, 0, n);
+                          }
+
+                          runOnUiThread(() -> playMyVoiceFile(wav));
+                      } catch (Exception e) {
+                          runOnUiThread(() -> {
+                              voiceStatusText.setText(
+                                      "⚠ 本人音色服务器不可用，已自动切到系统中文声音");
+                              speakSystemVoice(text);
+                          });
+                      } finally {
+                          if (conn != null) conn.disconnect();
+                      }
+                  }).start();
+              }
+
+              private void prepareForSpeaking() {
+                  speakingVoice = true;
+                  restartPending = false;
+                  if (recognizer != null) {
+                      try { recognizer.cancel(); } catch (Exception ignored) {}
+                      recognizerActive = false;
+                  }
+              }
+
+              private void speakSystemVoice(String text) {
+                  if (!systemTtsReady || systemTts == null) {
+                      voiceBusy.set(false);
+                      voiceStatusText.setText("⚠ 手机没有可用的中文TTS引擎");
+                      if (listening) scheduleRecognitionRestart(250L);
+                      synthesizeNextMyVoice();
+                      return;
+                  }
+
+                  prepareForSpeaking();
+                  String id = "myvoice-" + UUID.randomUUID();
+                  int result = systemTts.speak(
+                          text, TextToSpeech.QUEUE_FLUSH, null, id);
+                  if (result == TextToSpeech.ERROR) {
+                      finishVoicePlayback("⚠ 系统中文朗读启动失败");
+                  } else {
+                      voiceStatusText.setText(
+                              customVoiceReady()
+                                      ? "⚠ 本人音色不可用，正在用系统中文声音朗读"
+                                      : "🔊 正在用手机系统中文声音朗读");
+                  }
+              }
+
+              private void playMyVoiceFile(File wav) {
+                  try {
+                      prepareForSpeaking();
+                      if (voicePlayer != null) {
+                          try { voicePlayer.release(); } catch (Exception ignored) {}
+                      }
+                      voicePlayer = new MediaPlayer();
+                      voicePlayer.setDataSource(wav.getAbsolutePath());
+                      voicePlayer.setOnCompletionListener(mp -> {
+                          try { mp.release(); } catch (Exception ignored) {}
+                          voicePlayer = null;
+                          if (wav.exists()) wav.delete();
+                          finishVoicePlayback("✅ 我的声音已就绪");
+                      });
+                      voicePlayer.setOnErrorListener((mp, what, extra) -> {
+                          try { mp.release(); } catch (Exception ignored) {}
+                          voicePlayer = null;
+                          if (wav.exists()) wav.delete();
+                          finishVoicePlayback("⚠ 本人音色播放失败");
+                          return true;
+                      });
+                      voicePlayer.prepare();
+                      voicePlayer.start();
+                      voiceStatusText.setText("🔊 正在用我的声音朗读中文");
+                  } catch (Exception e) {
+                      if (wav.exists()) wav.delete();
+                      finishVoicePlayback("⚠ 本人音色播放失败");
+                  }
+              }
+
+              private void finishVoicePlayback(String status) {
+                  speakingVoice = false;
+                  voiceBusy.set(false);
+                  if (voiceStatusText != null) voiceStatusText.setText(status);
+                  if (listening) scheduleRecognitionRestart(250L);
+                  synthesizeNextMyVoice();
+              }
+
+              private void processQueue() {
+                  if (!translating.compareAndSet(false, true)) return;
+                  translateNext();
+              }
+
+              private void translateNext() {
+                  String text = queue.poll();
+
+                  if (text == null) {
+                      translating.set(false);
+                      if (listening) {
+                          statusText.setText("● 正在听阿语 (" + speechLanguages[languageIndex] + ")");
+                      } else {
+                          statusText.setText("● 待机");
+                      }
+                      return;
+                  }
+
+                  String direct = exactPhraseHit(text);
+                  if (direct != null) {
+                      appendChinese(direct);
+                      previousArabic = text;
+                      previousChinese = direct;
+                      rememberContext(text, direct);
+                      translateNext();
+                      return;
+                  }
+
+                  onlineTranslate(text, "", (onlineZh, online) -> {
+                      if (online && onlineZh != null && !onlineZh.trim().isEmpty()) {
+                          String finalZh = smartPostCorrect(text, onlineZh);
+                          appendChinese(finalZh);
+                          previousArabic = text;
+                          previousChinese = finalZh;
+                          rememberContext(text, finalZh);
+                          statusText.setText("● 在线高精度 · 上下文已启用");
+                          translateNext();
+                          return;
+                      }
+
+                      if (modelReady) {
+                          translator.translate(text)
+                                  .addOnSuccessListener(localResult -> {
+                                      String finalZh = smartPostCorrect(text, localResult);
+                                      appendChinese(finalZh);
+                                      previousArabic = text;
+                                      previousChinese = finalZh;
+                                      rememberContext(text, finalZh);
+                                      statusText.setText("● 本地备用翻译");
+                                      translateNext();
+                                  })
+                                  .addOnFailureListener(e -> {
+                                      appendChinese("[暂时无法翻译]");
+                                      statusText.setText("● 翻译服务暂不可用");
+                                      translateNext();
+                                  });
+                      } else {
+                          appendChinese("[在线翻译暂不可用]");
+                          statusText.setText("● 在线翻译暂不可用");
+                          translateNext();
+                      }
+                  });
+              }
+
+              @Override
+              protected void onDestroy() {
+                  listening = false;
+
+                  if (recognizer != null) {
+                      recognizer.destroy();
+                  }
+
+                  if (translator != null) {
+                      translator.close();
+                  }
+
+                  try { if (voiceRecorder != null) voiceRecorder.release(); } catch (Exception ignored) {}
+                  try { if (voicePlayer != null) voicePlayer.release(); } catch (Exception ignored) {}
+                  try {
+                      if (systemTts != null) {
+                          systemTts.stop();
+                          systemTts.shutdown();
+                      }
+                  } catch (Exception ignored) {}
+
+                  super.onDestroy();
+              }
+          }
+          EOF
+
+      - name: Static sanity checks
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          s = Path('app/src/main/java/com/hansom/arzhv10/MainActivity.java').read_text(encoding='utf-8')
+          checks = {
+              'Kuwait Arabic locale': '"ar-KW"' in s,
+              'Saudi fallback locale': '"ar-SA"' in s,
+              'Generic Arabic fallback': '"ar"' in s,
+              'Mic permission handler': 'onRequestPermissionsResult' in s,
+              'Recognizer state guard': 'recognizerActive' in s,
+              'Restart de-duplication': 'restartPending' in s,
+              'No 8 second forced minimum': 'EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS' not in s,
+              'Speech not blocked by model': 'if (!modelReady) return;\n                  if (!translating' not in s,
+              'Online-first final translation': 'onlineTranslate(text, "",' in s,
+              'Context window enabled': 'MAX_CONTEXT = 3' in s and 'recentArabic' in s,
+              'Queue anti-lag enabled': 'MAX_QUEUE = 2' in s and 'enqueueLatest' in s,
+              'Free MyVoice server endpoint': 'voiceServerUrl + "/tts"' in s,
+              'Free MyVoice upload endpoint': 'voiceServerUrl + "/upload_ref"' in s,
+              'MyVoice recording': 'MediaRecorder' in s and 'toggleVoiceRecording' in s,
+              'System TTS fallback': 'TextToSpeech' in s and 'speakSystemVoice' in s,
+              'Auto voice after translation': 'enqueueMyVoice' in s and 'appendChinese' in s,
+              'No ElevenLabs dependency': 'elevenlabs' not in s.lower() and 'xi-api-key' not in s.lower(),
+              'Partial Chinese flicker removed': 'partial 只显示阿语字幕' in s,
+              'Single error restart path': s.count('handler.postDelayed(() -> startRecognition(), delay);') == 0,
+          }
+          bad = [k for k,v in checks.items() if not v]
+          for k,v in checks.items():
+              print(('PASS ' if v else 'FAIL ') + k)
+          if bad:
+              raise SystemExit('Sanity checks failed: ' + ', '.join(bad))
+          PY
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Rename APK
+        run: cp app/build/outputs/apk/debug/app-debug.apk ArabicChineseTranslator-V10-Free-MyVoice.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArabicChineseTranslator-V10-Free-MyVoice-APK
+          path: ArabicChineseTranslator-V10-Free-MyVoice.apk
