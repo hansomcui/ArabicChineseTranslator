@@ -1,0 +1,183 @@
+name: Build Arabic Live Interpreter V13.1 Fixed Auto
+
+on:
+  push:
+    paths:
+      - '.github/workflows/V13.1-fixed-auto.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Install Android native toolchain
+        shell: bash
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;25.2.9519653" "cmake;3.22.1"
+
+      - name: Reuse V13.1 generator
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import textwrap
+
+          src = Path('.github/workflows/V13.1.yml').read_text(encoding='utf-8')
+
+          def extract(name, out):
+              marker = f"      - name: {name}\n"
+              a = src.index(marker)
+              r = src.index("        run: |\n", a) + len("        run: |\n")
+              n = src.find("\n      - name:", r)
+              if n < 0:
+                  n = len(src)
+              block = textwrap.dedent(src[r:n])
+              Path(out).write_text(block + "\n", encoding='utf-8')
+
+          extract('Fetch Whisper and sherpa runtimes', '/tmp/v131-fetch.sh')
+          extract('Generate Android project', '/tmp/v131-generate.sh')
+          PY
+          bash /tmp/v131-fetch.sh
+          bash /tmp/v131-generate.sh
+
+      - name: Apply deterministic regex hotfix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          fixes = {
+              Path('app/src/main/java/com/hansom/arzhv13/RollingTranscriptAssembler.kt'): [
+                  (r'Regex("""\\s+""")', r'Regex("""\s+""")'),
+                  (r'Regex("""[^\\p{L}\\p{N}]""")', r'Regex("""[^\p{L}\p{N}]""")'),
+              ],
+              Path('app/src/main/java/com/hansom/arzhv13/DialectAsrEngine.kt'): [
+                  (r'Regex("""\\[[^\\]]+]""")', r'Regex("""\[[^\]]+]""")'),
+                  (r'Regex("""\\([^)]*music[^)]*\\)""", RegexOption.IGNORE_CASE)', r'Regex("""\([^)]*music[^)]*\)""", RegexOption.IGNORE_CASE)'),
+                  (r'Regex("""\\s+""")', r'Regex("""\s+""")'),
+              ],
+          }
+
+          for path, replacements in fixes.items():
+              s = path.read_text(encoding='utf-8')
+              for old, new in replacements:
+                  if old not in s:
+                      raise SystemExit(f'Expected buggy pattern not found in {path}: {old}')
+                  s = s.replace(old, new)
+              path.write_text(s, encoding='utf-8')
+              print(f'Patched {path}')
+
+          rolling = Path('app/src/main/java/com/hansom/arzhv13/RollingTranscriptAssembler.kt').read_text(encoding='utf-8')
+          assert r'Regex("""\\s+""")' not in rolling
+          assert r'Regex("""[^\\p{L}\\p{N}]""")' not in rolling
+          PY
+
+      - name: Add V13.1 hotfix regression tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > app/src/test/java/com/hansom/arzhv13/V131HotfixRegressionTest.kt <<'EOF'
+          package com.hansom.arzhv13
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          class V131HotfixRegressionTest {
+              @Test fun whitespaceAndNewlinesRemainRealWordBoundaries() {
+                  val a = RollingTranscriptAssembler()
+                  a.update("شنو   المطلوب\nمن الشركة")
+                  val u = a.update("من الشركة\tالحين وكم السعر")
+                  assertEquals("شنو المطلوب", u.stable)
+                  assertEquals("شنو المطلوب من الشركة الحين وكم السعر", u.preview)
+              }
+
+              @Test fun arabicPunctuationDoesNotBreakWindowOverlap() {
+                  val a = RollingTranscriptAssembler()
+                  a.update("أبي أعرف السعر النهائي؟")
+                  val u = a.update("السعر النهائي اليوم")
+                  assertEquals("أبي أعرف", u.stable)
+                  assertTrue(u.preview.contains("السعر النهائي اليوم"))
+              }
+
+              @Test fun silenceFlushPreservesLastWordsAfterSlidingUpdates() {
+                  val a = RollingTranscriptAssembler()
+                  a.update("عايز أعرف السعر")
+                  a.update("السعر دلوقتي ومفيش وقت")
+                  val f = a.update("", flush = true)
+                  assertTrue(f.finalText.contains("عايز أعرف"))
+                  assertTrue(f.finalText.contains("السعر دلوقتي ومفيش وقت"))
+              }
+          }
+          EOF
+
+          python3 - <<'PY'
+          from pathlib import Path
+          rolling = Path('app/src/main/java/com/hansom/arzhv13/RollingTranscriptAssembler.kt').read_text(encoding='utf-8')
+          asr = Path('app/src/main/java/com/hansom/arzhv13/DialectAsrEngine.kt').read_text(encoding='utf-8')
+          assert r'Regex("""\\s+""")' not in rolling
+          assert r'Regex("""[^\\p{L}\\p{N}]""")' not in rolling
+          assert r'Regex("""\\s+""")' not in asr
+          assert r'Regex("""\\[[^\\]]+]""")' not in asr
+          assert r'Regex("""\s+""")' in rolling
+          assert r'Regex("""[^\p{L}\p{N}]""")' in rolling
+          print('PASS hotfix source semantics checks')
+          PY
+
+      - name: Unit tests pass 1
+        shell: bash
+        run: gradle :app:testDebugUnitTest --stacktrace
+
+      - name: Unit tests pass 2 fresh
+        shell: bash
+        run: gradle :app:testDebugUnitTest --rerun-tasks --stacktrace
+
+      - name: Build APK
+        shell: bash
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify APK round 1
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s app/build/outputs/apk/debug/app-debug.apk
+          unzip -t app/build/outputs/apk/debug/app-debug.apk >/tmp/unzip-test.txt
+          tail -n 2 /tmp/unzip-test.txt
+
+      - name: Verify APK round 2
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp app/build/outputs/apk/debug/app-debug.apk dist/ArabicLiveInterpreter-V13.1-Fixed.apk
+          sha256sum dist/ArabicLiveInterpreter-V13.1-Fixed.apk | tee dist/SHA256.txt
+          test $(stat -c%s dist/ArabicLiveInterpreter-V13.1-Fixed.apk) -gt 10000000
+          unzip -l dist/ArabicLiveInterpreter-V13.1-Fixed.apk | grep -q 'lib/arm64-v8a/'
+          echo 'APK structure and arm64 native libraries verified.'
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArabicLiveInterpreter-V13.1-Fixed-APK
+          path: |
+            dist/ArabicLiveInterpreter-V13.1-Fixed.apk
+            dist/SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
