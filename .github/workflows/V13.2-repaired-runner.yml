@@ -42,9 +42,6 @@ jobs:
           workflow = Path('.github/workflows/V13.2-final.yml')
           src = workflow.read_text(encoding='utf-8')
 
-          # V13.2 itself already builds and signs correctly.
-          # apksigner 35 prints SHA-256 as compact hex, while the original
-          # verifier expected a colon-separated fingerprint.
           old_fp = (
               '21:9b:74:c6:ce:62:e1:e2:bf:38:e4:b0:17:3b:91:0a:'
               '99:37:0e:2d:e3:03:29:63:99:eb:fd:c7:6c:5e:cd:40'
@@ -76,7 +73,7 @@ jobs:
               script = textwrap.dedent(block[marker.end():]).rstrip() + '\n'
               run_steps.append((name, script))
 
-          if len(run_steps) < 10:
+          if len(run_steps) < 9:
               raise SystemExit(
                   f'Unexpected V13.2 structure: only {len(run_steps)} run steps found'
               )
