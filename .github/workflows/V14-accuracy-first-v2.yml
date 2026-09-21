@@ -1,0 +1,1015 @@
+name: Build V14.0 Accuracy First Arabic Lab
+
+on:
+  push:
+    paths:
+      - '.github/workflows/V14-accuracy-first-v2.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+
+    steps:
+      - name: Checkout pinned proven base
+        uses: actions/checkout@v4
+        with:
+          ref: 46ec75c5c1a47770753c21d540f0d7e1103d9a8b
+          fetch-depth: 1
+
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Install build dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check 'PyYAML>=6,<7'
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;25.2.9519653" "cmake;3.22.1"
+
+      - name: Generate proven Android base
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import os, subprocess, yaml
+
+          source = Path('.github/workflows/V13.1.yml')
+          data = yaml.safe_load(source.read_text(encoding='utf-8'))
+          steps = data['jobs']['build']['steps']
+          wanted = ['Fetch Whisper and sherpa runtimes', 'Generate Android project']
+          found = []
+          for step in steps:
+              if step.get('name') in wanted:
+                  found.append((step['name'], step['run']))
+          if [x[0] for x in found] != wanted:
+              raise SystemExit(f'V13.1 base steps mismatch: {[x[0] for x in found]}')
+          for i, (name, script) in enumerate(found, 1):
+              print(f'===== BASE {i}/2: {name} =====', flush=True)
+              subprocess.run(
+                  ['bash', '-c', 'set -euo pipefail\n' + script],
+                  check=True,
+                  env=os.environ.copy(),
+              )
+          PY
+
+      - name: Install V14 accuracy-first engine
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          # ---- Gradle / package ----
+          g = Path('app/build.gradle')
+          s = g.read_text(encoding='utf-8')
+          s = s.replace("namespace 'com.hansom.arzhv13'", "namespace 'com.hansom.arzhv14'")
+          s = s.replace("applicationId 'com.hansom.arzhv13'", "applicationId 'com.hansom.arzhv14'")
+          s = s.replace("versionCode 131", "versionCode 140")
+          s = s.replace("versionName '13.1'", "versionName '14.0'")
+          g.write_text(s, encoding='utf-8')
+
+          # ---- Manifest ----
+          m = Path('app/src/main/AndroidManifest.xml')
+          ms = m.read_text(encoding='utf-8')
+          ms = ms.replace('阿语方言同传 V13.1', '阿语高精度识别实验室 V14')
+          m.write_text(ms, encoding='utf-8')
+
+          # ---- whisper.cpp JNI: accuracy-first decoding ----
+          j = Path('vendor/whisper.cpp/examples/whisper.android.java/app/src/main/jni/whisper/jni.c')
+          js = j.read_text(encoding='utf-8')
+
+          checks = {
+              'greedy default': 'whisper_full_default_params(WHISPER_SAMPLING_GREEDY)' in js,
+              'Arabic language': 'params.language = "ar";' in js,
+              'no context': 'params.no_context = true;' in js,
+              'single segment': 'params.single_segment = true;' in js,
+              'thread anchor': 'params.n_threads = num_threads;' in js,
+          }
+          bad = [k for k,v in checks.items() if not v]
+          if bad:
+              raise SystemExit('JNI base mismatch: ' + ', '.join(bad))
+
+          js = js.replace(
+              'whisper_full_default_params(WHISPER_SAMPLING_GREEDY)',
+              'whisper_full_default_params(WHISPER_SAMPLING_BEAM_SEARCH)',
+              1,
+          )
+          js = js.replace('params.no_context = true;', 'params.no_context = false;', 1)
+          js = js.replace('params.single_segment = true;', 'params.single_segment = false;', 1)
+
+          anchor = '    params.n_threads = num_threads;\n'
+          accuracy = (
+              '    params.token_timestamps = true;\n'
+              '    params.thold_pt = 0.01f;\n'
+              '    params.thold_ptsum = 0.01f;\n'
+              '    params.beam_search.beam_size = 5;\n'
+              '    params.beam_search.patience = 1.0f;\n'
+              '    params.temperature = 0.0f;\n'
+              '    params.split_on_word = true;\n'
+              '    params.initial_prompt = "هذه محادثة عربية خليجية أو كويتية في مجال النفط والغاز. كلمات محتملة: KOC، جهاز الحفر، الحفارة، رأس البئر، مضخة الطين، مانع الانفجار، الأنابيب الملفوفة، ESP، VSD، SCADA، مناقصة، عرض سعر.";\n'
+              '    params.carry_initial_prompt = false;\n'
+          )
+          if js.count(anchor) != 1:
+              raise SystemExit(f'JNI thread anchor count={js.count(anchor)}')
+          js = js.replace(anchor, anchor + accuracy, 1)
+          j.write_text(js, encoding='utf-8')
+          PY
+
+          cat > app/src/main/java/com/hansom/arzhv13/SentenceAssembler.kt <<'EOFK'
+          package com.hansom.arzhv14
+
+          object SentenceAssembler {
+              data class Segment(
+                  val startMs: Long,
+                  val endMs: Long,
+                  val text: String,
+              )
+
+              data class Result(
+                  val merged: String,
+                  val organized: String,
+                  val segmentCount: Int,
+              )
+
+              fun assemble(segments: List<Segment>): Result {
+                  val clean = segments
+                      .map { it.copy(text = cleanText(it.text)) }
+                      .filter { it.text.isNotBlank() }
+
+                  if (clean.isEmpty()) {
+                      return Result("", "", 0)
+                  }
+
+                  val mergedWords = ArrayList<String>()
+
+                  for (seg in clean) {
+                      val words = words(seg.text)
+                      if (words.isEmpty()) continue
+
+                      if (mergedWords.isEmpty()) {
+                          mergedWords.addAll(words)
+                          continue
+                      }
+
+                      // Exact/normalized suffix-prefix consensus.
+                      val overlap = longestSuffixPrefix(mergedWords, words)
+                      if (overlap > 0) {
+                          mergedWords.addAll(words.drop(overlap))
+                          continue
+                      }
+
+                      // If a whole segment is already present near the tail, do not duplicate it.
+                      val tail = mergedWords.takeLast(minOf(20, mergedWords.size))
+                      if (containsSequence(tail, words)) continue
+
+                      mergedWords.addAll(words)
+                  }
+
+                  val merged = fixPunctuationSpacing(mergedWords.joinToString(" "))
+                  val organized = conservativeOrganize(merged)
+                  return Result(merged, organized, clean.size)
+              }
+
+              private fun cleanText(s0: String): String =
+                  s0.replace(Regex("""\[[^\]]+]"""), " ")
+                      .replace(Regex("""\([^)]*(music|applause|laughter)[^)]*\)""", RegexOption.IGNORE_CASE), " ")
+                      .replace(Regex("""\s+"""), " ")
+                      .trim()
+
+              private fun words(s: String): List<String> =
+                  s.split(Regex("""\s+""")).filter { it.isNotBlank() }
+
+              private fun norm(s: String): String =
+                  s.replace(Regex("""[^\p{L}\p{N}]"""), "")
+                      .replace("أ", "ا")
+                      .replace("إ", "ا")
+                      .replace("آ", "ا")
+                      .replace("ى", "ي")
+                      .replace("ة", "ه")
+                      .lowercase()
+
+              private fun same(a: String, b: String): Boolean =
+                  norm(a) == norm(b) && norm(a).isNotBlank()
+
+              private fun longestSuffixPrefix(a: List<String>, b: List<String>): Int {
+                  val max = minOf(a.size, b.size, 16)
+                  for (k in max downTo 1) {
+                      var ok = true
+                      for (i in 0 until k) {
+                          if (!same(a[a.size - k + i], b[i])) {
+                              ok = false
+                              break
+                          }
+                      }
+                      if (ok) return k
+                  }
+                  return 0
+              }
+
+              private fun containsSequence(hay: List<String>, needle: List<String>): Boolean {
+                  if (needle.isEmpty() || needle.size > hay.size) return false
+                  for (start in 0..hay.size - needle.size) {
+                      var ok = true
+                      for (i in needle.indices) {
+                          if (!same(hay[start + i], needle[i])) {
+                              ok = false
+                              break
+                          }
+                      }
+                      if (ok) return true
+                  }
+                  return false
+              }
+
+              private fun fixPunctuationSpacing(s0: String): String =
+                  s0.replace(Regex("""\s+([،؛؟.!,:;])"""), "$1")
+                      .replace(Regex("""([،؛؟.!,:;])(?=[\p{L}\p{N}])"""), "$1 ")
+                      .replace(Regex("""\s+"""), " ")
+                      .trim()
+
+              private fun conservativeOrganize(s0: String): String {
+                  var s = fixPunctuationSpacing(s0)
+                  if (s.isBlank()) return s
+
+                  // Never rewrite vocabulary. Only add a terminal mark when Whisper omitted one.
+                  if (!s.matches(Regex(""".*[.؟?!؛]$"""))) {
+                      val first = words(s).firstOrNull()?.let(::norm).orEmpty()
+                      val question = first in setOf(
+                          "هل", "ليش", "شنو", "وش", "ايش", "كيف", "شلون",
+                          "كم", "وين", "متي", "من", "منو", "ماذا", "ما"
+                      )
+                      s += if (question) "؟" else "."
+                  }
+                  return s
+              }
+          }
+          EOFK
+
+          cat > app/src/main/java/com/hansom/arzhv13/AccuracyAsrEngine.kt <<'EOFK'
+          package com.hansom.arzhv14
+
+          import android.Manifest
+          import android.content.Context
+          import android.content.pm.PackageManager
+          import android.media.AudioFormat
+          import android.media.AudioRecord
+          import android.media.MediaRecorder
+          import android.os.Handler
+          import android.os.Looper
+          import com.whispercpp.java.whisper.WhisperLib
+          import java.io.File
+          import java.io.FileOutputStream
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.concurrent.atomic.AtomicBoolean
+          import kotlin.concurrent.thread
+          import kotlin.math.log10
+          import kotlin.math.sqrt
+
+          class AccuracyAsrEngine(
+              private val context: Context,
+              private val listener: Listener,
+          ) {
+              interface Listener {
+                  fun onStatus(text: String)
+                  fun onModelReady(ready: Boolean)
+                  fun onRecordingChanged(recording: Boolean)
+                  fun onMic(dbfs: Float, seconds: Float)
+                  fun onDecodeStarted(audioMs: Int)
+                  fun onDecodeFinished(
+                      rawSegments: List<SentenceAssembler.Segment>,
+                      result: SentenceAssembler.Result,
+                      latencyMs: Long,
+                  )
+              }
+
+              companion object {
+                  private const val SAMPLE_RATE = 16000
+                  private const val MAX_RECORD_MS = 25_000L
+                  private const val MIN_RECORD_MS = 900L
+                  private const val AUTO_SILENCE_MS = 1_350L
+                  private const val SIGNAL_RMS = 0.0070f
+                  private const val MODEL_FILE = "ggml-model-q5_0.bin"
+                  private const val MODEL_URL =
+                      "https://huggingface.co/dmouayad/whisper-large-v3-turbo-arabic-dialectal-v2-gguf/resolve/main/ggml-model-q5_0.bin?download=true"
+                  private const val MIN_MODEL_BYTES = 530_000_000L
+                  private const val THREADS = 6
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val modelDir = File(context.filesDir, "v14_accuracy_asr")
+              private val modelFile = File(modelDir, MODEL_FILE)
+              private val recording = AtomicBoolean(false)
+              private val processing = AtomicBoolean(false)
+              private val modelBusy = AtomicBoolean(false)
+              private val initBusy = AtomicBoolean(false)
+
+              @Volatile private var recorder: AudioRecord? = null
+              @Volatile private var contextPtr = 0L
+              @Volatile private var lastAudio: FloatArray? = null
+
+              fun isModelReady(): Boolean =
+                  modelFile.isFile && modelFile.length() >= MIN_MODEL_BYTES
+
+              fun isReady(): Boolean = isModelReady() && contextPtr != 0L
+              fun isRecording(): Boolean = recording.get()
+              fun isProcessing(): Boolean = processing.get()
+              fun hasLastAudio(): Boolean = lastAudio?.isNotEmpty() == true
+
+              fun initializeIfPossible() {
+                  if (!isModelReady()) {
+                      listenerModel(false)
+                      status("🧠 V14 Q5高精度模型未下载 · 首次约574MB")
+                      return
+                  }
+                  if (contextPtr != 0L) {
+                      listenerModel(true)
+                      return
+                  }
+                  if (!initBusy.compareAndSet(false, true)) return
+                  status("● 正在加载Q5高精度阿语方言模型…")
+                  thread(name = "v14-model-init") {
+                      try {
+                          val ptr = WhisperLib.initContext(modelFile.absolutePath)
+                          if (ptr == 0L) error("模型加载失败")
+                          contextPtr = ptr
+                          listenerModel(true)
+                          status("✅ V14 Accuracy First 已就绪 · Beam5 / Q5 / 长上下文")
+                      } catch (t: Throwable) {
+                          contextPtr = 0L
+                          listenerModel(false)
+                          status("❌ 模型加载失败：${short(t)}")
+                      } finally {
+                          initBusy.set(false)
+                      }
+                  }
+              }
+
+              fun ensureModel() {
+                  if (isModelReady()) {
+                      initializeIfPossible()
+                      return
+                  }
+                  if (!modelBusy.compareAndSet(false, true)) return
+                  thread(name = "v14-model-download") {
+                      try {
+                          modelDir.mkdirs()
+                          downloadResumable()
+                          if (!isModelReady()) {
+                              modelFile.delete()
+                              error("模型文件大小异常")
+                          }
+                          status("✅ Q5模型下载完成，正在加载…")
+                          initializeIfPossible()
+                      } catch (t: Throwable) {
+                          listenerModel(false)
+                          status("❌ 模型下载失败：${short(t)}")
+                      } finally {
+                          modelBusy.set(false)
+                      }
+                  }
+              }
+
+              fun startSentence() {
+                  if (processing.get()) {
+                      status("⚠ 正在分析上一句，请等待")
+                      return
+                  }
+                  if (!isReady()) {
+                      status("⚠ 请先下载并加载Q5高精度模型")
+                      return
+                  }
+                  if (
+                      context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                      PackageManager.PERMISSION_GRANTED
+                  ) {
+                      status("⚠ 请允许麦克风权限")
+                      return
+                  }
+                  if (!recording.compareAndSet(false, true)) return
+                  listenerRecording(true)
+                  thread(name = "v14-accuracy-record") { captureSentence() }
+              }
+
+              fun stopSentence() {
+                  if (!recording.compareAndSet(true, false)) return
+                  runCatching { recorder?.stop() }
+                  status("■ 已停止收音，准备高精度分析…")
+              }
+
+              fun reanalyzeLast() {
+                  val audio = lastAudio
+                  if (audio == null || audio.isEmpty()) {
+                      status("⚠ 还没有可重新分析的录音")
+                      return
+                  }
+                  analyze(audio.copyOf())
+              }
+
+              private fun captureSentence() {
+                  val min = AudioRecord.getMinBufferSize(
+                      SAMPLE_RATE,
+                      AudioFormat.CHANNEL_IN_MONO,
+                      AudioFormat.ENCODING_PCM_16BIT,
+                  )
+                  if (min <= 0) {
+                      recording.set(false)
+                      listenerRecording(false)
+                      status("❌ AudioRecord初始化失败")
+                      return
+                  }
+
+                  val rec = AudioRecord(
+                      MediaRecorder.AudioSource.MIC,
+                      SAMPLE_RATE,
+                      AudioFormat.CHANNEL_IN_MONO,
+                      AudioFormat.ENCODING_PCM_16BIT,
+                      maxOf(min * 2, 8192),
+                  )
+                  if (rec.state != AudioRecord.STATE_INITIALIZED) {
+                      rec.release()
+                      recording.set(false)
+                      listenerRecording(false)
+                      status("❌ 麦克风初始化失败")
+                      return
+                  }
+
+                  recorder = rec
+                  val chunks = ArrayList<ShortArray>()
+                  val buf = ShortArray(maxOf(4096, min / 2))
+                  val started = System.currentTimeMillis()
+                  var lastSignalAt = started
+                  var seenSignal = false
+                  var total = 0
+
+                  try {
+                      rec.startRecording()
+                      status("🎙 请完整说一句阿拉伯语 · 不切片、不翻译")
+                      while (recording.get()) {
+                          val n = rec.read(buf, 0, buf.size)
+                          if (n <= 0) continue
+
+                          chunks.add(buf.copyOf(n))
+                          total += n
+                          val now = System.currentTimeMillis()
+                          val rms = rms(buf, n)
+                          if (rms >= SIGNAL_RMS) {
+                              seenSignal = true
+                              lastSignalAt = now
+                          }
+
+                          val elapsed = now - started
+                          emitMic(rms, total.toFloat() / SAMPLE_RATE)
+
+                          if (
+                              seenSignal &&
+                              elapsed >= 1800L &&
+                              now - lastSignalAt >= AUTO_SILENCE_MS
+                          ) {
+                              status("✓ 检测到句末停顿，自动结束收音")
+                              recording.set(false)
+                              break
+                          }
+                          if (elapsed >= MAX_RECORD_MS) {
+                              status("✓ 已到25秒上限，自动结束收音")
+                              recording.set(false)
+                              break
+                          }
+                      }
+                  } catch (t: Throwable) {
+                      status("❌ 录音异常：${short(t)}")
+                  } finally {
+                      runCatching { rec.stop() }
+                      rec.release()
+                      recorder = null
+                      recording.set(false)
+                      listenerRecording(false)
+                  }
+
+                  if (total * 1000L / SAMPLE_RATE < MIN_RECORD_MS) {
+                      status("⚠ 录音太短，请重新完整说一句")
+                      return
+                  }
+
+                  val audio = FloatArray(total)
+                  var off = 0
+                  for (chunk in chunks) {
+                      for (x in chunk) audio[off++] = x / 32768.0f
+                  }
+                  lastAudio = audio
+                  analyze(audio)
+              }
+
+              private fun analyze(audio: FloatArray) {
+                  if (!processing.compareAndSet(false, true)) return
+                  thread(name = "v14-accuracy-decode") {
+                      val started = System.currentTimeMillis()
+                      try {
+                          val ptr = contextPtr
+                          if (ptr == 0L) error("模型尚未加载")
+                          val audioMs = audio.size * 1000 / SAMPLE_RATE
+                          main.post { listener.onDecodeStarted(audioMs) }
+
+                          WhisperLib.fullTranscribe(ptr, THREADS, audio)
+                          val n = WhisperLib.getTextSegmentCount(ptr)
+                          val segments = ArrayList<SentenceAssembler.Segment>()
+                          for (i in 0 until n) {
+                              val text = WhisperLib.getTextSegment(ptr, i)?.trim().orEmpty()
+                              if (text.isBlank()) continue
+                              val t0 = WhisperLib.getTextSegmentT0(ptr, i) * 10L
+                              val t1 = WhisperLib.getTextSegmentT1(ptr, i) * 10L
+                              segments.add(
+                                  SentenceAssembler.Segment(
+                                      startMs = t0,
+                                      endMs = t1,
+                                      text = text,
+                                  )
+                              )
+                          }
+
+                          val result = SentenceAssembler.assemble(segments)
+                          val latency = System.currentTimeMillis() - started
+                          main.post {
+                              listener.onDecodeFinished(segments, result, latency)
+                          }
+                      } catch (t: Throwable) {
+                          status("❌ 高精度识别失败：${short(t)}")
+                      } finally {
+                          processing.set(false)
+                      }
+                  }
+              }
+
+              private fun downloadResumable() {
+                  modelDir.mkdirs()
+                  val part = File(modelFile.absolutePath + ".part")
+                  val start = if (part.isFile) part.length() else 0L
+                  var current = MODEL_URL
+                  repeat(8) {
+                      val c = (URL(current).openConnection() as HttpURLConnection).apply {
+                          instanceFollowRedirects = false
+                          connectTimeout = 15000
+                          readTimeout = 120000
+                          requestMethod = "GET"
+                          setRequestProperty("User-Agent", "ArabicAccuracyLab-V14/1.0")
+                          if (start > 0) setRequestProperty("Range", "bytes=$start-")
+                      }
+                      val code = c.responseCode
+                      if (code in listOf(301, 302, 303, 307, 308)) {
+                          val next = c.getHeaderField("Location") ?: error("重定向缺少Location")
+                          c.disconnect()
+                          current = URL(URL(current), next).toString()
+                          return@repeat
+                      }
+                      if (code !in 200..299) {
+                          c.disconnect()
+                          error("HTTP $code")
+                      }
+
+                      val append = start > 0 && code == 206
+                      if (!append && start > 0) part.delete()
+                      var done = if (append) start else 0L
+                      var lastUi = 0L
+
+                      c.inputStream.use { input ->
+                          FileOutputStream(part, append).use { out ->
+                              val b = ByteArray(128 * 1024)
+                              while (true) {
+                                  val n = input.read(b)
+                                  if (n < 0) break
+                                  out.write(b, 0, n)
+                                  done += n
+                                  val now = System.currentTimeMillis()
+                                  if (now - lastUi >= 700) {
+                                      lastUi = now
+                                      status("⬇ Q5模型：${"%.1f".format(done / 1024.0 / 1024.0)} MB")
+                                  }
+                              }
+                          }
+                      }
+                      c.disconnect()
+
+                      if (modelFile.exists()) modelFile.delete()
+                      if (!part.renameTo(modelFile)) {
+                          part.copyTo(modelFile, overwrite = true)
+                          part.delete()
+                      }
+                      return
+                  }
+                  error("下载重定向次数过多")
+              }
+
+              fun release() {
+                  recording.set(false)
+                  runCatching { recorder?.stop() }
+                  val ptr = contextPtr
+                  contextPtr = 0L
+                  if (ptr != 0L) runCatching { WhisperLib.freeContext(ptr) }
+              }
+
+              private fun rms(a: ShortArray, n: Int): Float {
+                  var sum = 0.0
+                  for (i in 0 until n) {
+                      val x = a[i] / 32768.0
+                      sum += x * x
+                  }
+                  return sqrt(sum / n.coerceAtLeast(1)).toFloat()
+              }
+
+              private fun dbfs(rms: Float): Float =
+                  if (rms <= 0.000001f) -120f else (20.0 * log10(rms.toDouble())).toFloat()
+
+              private fun emitMic(rms: Float, seconds: Float) =
+                  main.post { listener.onMic(dbfs(rms), seconds) }
+
+              private fun status(s: String) = main.post { listener.onStatus(s) }
+              private fun listenerModel(v: Boolean) = main.post { listener.onModelReady(v) }
+              private fun listenerRecording(v: Boolean) =
+                  main.post { listener.onRecordingChanged(v) }
+
+              private fun short(t: Throwable): String =
+                  (t.message ?: t::class.java.simpleName).replace('\n', ' ').take(140)
+          }
+          EOFK
+
+          cat > app/src/main/java/com/hansom/arzhv13/MainActivity.kt <<'EOFK'
+          package com.hansom.arzhv14
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+              private lateinit var engine: AccuracyAsrEngine
+              private lateinit var status: TextView
+              private lateinit var mic: TextView
+              private lateinit var modelBtn: Button
+              private lateinit var recordBtn: Button
+              private lateinit var reanalyzeBtn: Button
+              private lateinit var rawSegments: TextView
+              private lateinit var merged: TextView
+              private lateinit var organized: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+                  engine = AccuracyAsrEngine(this, object : AccuracyAsrEngine.Listener {
+                      override fun onStatus(text: String) {
+                          status.text = text
+                      }
+
+                      override fun onModelReady(ready: Boolean) {
+                          modelBtn.text = if (ready) {
+                              "✅ Q5高精度模型：已就绪"
+                          } else {
+                              "下载Q5高精度阿语方言模型（约574MB）"
+                          }
+                          recordBtn.isEnabled = ready
+                      }
+
+                      override fun onRecordingChanged(recording: Boolean) {
+                          recordBtn.text = if (recording) {
+                              "■ 停止并高精度分析"
+                          } else {
+                              "🎙 录一句完整阿语"
+                          }
+                      }
+
+                      override fun onMic(dbfs: Float, seconds: Float) {
+                          mic.text = "🎤 ${"%.1f".format(dbfs)} dBFS · 已录 ${"%.1f".format(seconds)} 秒"
+                      }
+
+                      override fun onDecodeStarted(audioMs: Int) {
+                          status.text = "🧠 正在高精度识别 ${audioMs / 1000.0} 秒音频 · Beam5 · 请等待"
+                          rawSegments.text = "正在分析原始分段……"
+                          merged.text = "正在整合……"
+                          organized.text = "正在组织……"
+                      }
+
+                      override fun onDecodeFinished(
+                          raw: List<SentenceAssembler.Segment>,
+                          result: SentenceAssembler.Result,
+                          latencyMs: Long,
+                      ) {
+                          rawSegments.text = if (raw.isEmpty()) {
+                              "未识别到有效语音"
+                          } else {
+                              raw.joinToString("\n") {
+                                  "[${"%.2f".format(it.startMs / 1000.0)}–${"%.2f".format(it.endMs / 1000.0)}] ${it.text}"
+                              }
+                          }
+                          merged.text = result.merged.ifBlank { "—" }
+                          organized.text = result.organized.ifBlank { "—" }
+                          status.text =
+                              "✅ 高精度识别完成 · ${result.segmentCount}段 · 推理 ${latencyMs / 1000.0} 秒"
+                          reanalyzeBtn.isEnabled = engine.hasLastAudio()
+                      }
+                  })
+
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1401)
+                  }
+                  engine.initializeIfPossible()
+              }
+
+              private fun buildUi() {
+                  val scroll = ScrollView(this)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(20), dp(18), dp(28))
+                      setBackgroundColor(Color.rgb(245, 245, 245))
+                  }
+                  scroll.addView(root)
+
+                  root.addView(TextView(this).apply {
+                      text = "V14.0 · Accuracy First Arabic Lab"
+                      textSize = 25f
+                      setTypeface(null, 1)
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.BLACK)
+                  })
+                  root.addView(TextView(this).apply {
+                      text = "先求对，再求快 · 完整录音 → Q5方言Whisper → Beam5 → 时间戳 → 句子整合\n本版暂时不翻译"
+                      textSize = 14f
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(8), 0, dp(12))
+                  })
+
+                  status = TextView(this).apply {
+                      text = "● V14启动中"
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(6), 0, dp(8))
+                  }
+                  root.addView(status)
+
+                  modelBtn = Button(this).apply {
+                      text = "下载Q5高精度阿语方言模型（约574MB）"
+                      isAllCaps = false
+                      setOnClickListener { engine.ensureModel() }
+                  }
+                  root.addView(modelBtn)
+
+                  recordBtn = Button(this).apply {
+                      text = "🎙 录一句完整阿语"
+                      textSize = 20f
+                      isAllCaps = false
+                      isEnabled = false
+                      setOnClickListener {
+                          if (
+                              checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                              PackageManager.PERMISSION_GRANTED
+                          ) {
+                              requestPermissions(arrayOf(Manifest.permission.RECORD_AUDIO), 1401)
+                          } else if (engine.isProcessing()) {
+                              Toast.makeText(this@MainActivity, "正在分析上一句", Toast.LENGTH_SHORT).show()
+                          } else if (engine.isRecording()) {
+                              engine.stopSentence()
+                          } else {
+                              engine.startSentence()
+                          }
+                      }
+                  }
+                  root.addView(recordBtn)
+
+                  reanalyzeBtn = Button(this).apply {
+                      text = "🧪 重新分析上一次录音"
+                      isAllCaps = false
+                      isEnabled = false
+                      setOnClickListener { engine.reanalyzeLast() }
+                  }
+                  root.addView(reanalyzeBtn)
+
+                  mic = TextView(this).apply {
+                      text = "🎤 等待录音"
+                      textSize = 14f
+                      setPadding(dp(4), dp(10), dp(4), dp(6))
+                  }
+                  root.addView(mic)
+
+                  root.addView(section("① Whisper原始分段 + 时间戳"))
+                  rawSegments = box("等待录音……", rtl = true)
+                  root.addView(rawSegments)
+
+                  root.addView(section("② 时间轴/重叠整合结果"))
+                  merged = box("等待整合……", rtl = true)
+                  root.addView(merged)
+
+                  root.addView(section("③ 保守句子组织结果"))
+                  organized = box("等待组织……", rtl = true)
+                  root.addView(organized)
+
+                  setContentView(scroll)
+              }
+
+              private fun section(s: String) = TextView(this).apply {
+                  text = s
+                  textSize = 17f
+                  setTypeface(null, 1)
+                  setPadding(0, dp(18), 0, dp(6))
+              }
+
+              private fun box(initial: String, rtl: Boolean) = TextView(this).apply {
+                  text = initial
+                  textSize = 20f
+                  minHeight = dp(130)
+                  setPadding(dp(14), dp(14), dp(14), dp(14))
+                  setBackgroundColor(Color.WHITE)
+                  gravity = if (rtl) Gravity.RIGHT else Gravity.LEFT
+                  setTextIsSelectable(true)
+              }
+
+              private fun dp(v: Int): Int =
+                  (v * resources.displayMetrics.density + 0.5f).toInt()
+
+              override fun onResume() {
+                  super.onResume()
+                  if (::engine.isInitialized) engine.initializeIfPossible()
+              }
+
+              override fun onDestroy() {
+                  if (::engine.isInitialized) engine.release()
+                  super.onDestroy()
+              }
+          }
+          EOFK
+
+          mkdir -p app/src/test/java/com/hansom/arzhv14
+          cat > app/src/test/java/com/hansom/arzhv14/SentenceAssemblerTest.kt <<'EOFT'
+          package com.hansom.arzhv14
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          class SentenceAssemblerTest {
+              @Test fun removesOverlapWithoutDroppingWords() {
+                  val r = SentenceAssembler.assemble(
+                      listOf(
+                          SentenceAssembler.Segment(0, 3000, "شنو المطلوب من الشركة"),
+                          SentenceAssembler.Segment(2500, 6000, "من الشركة الحين وكم السعر النهائي"),
+                      )
+                  )
+                  assertEquals(
+                      "شنو المطلوب من الشركة الحين وكم السعر النهائي",
+                      r.merged
+                  )
+              }
+
+              @Test fun keepsDistinctSegments() {
+                  val r = SentenceAssembler.assemble(
+                      listOf(
+                          SentenceAssembler.Segment(0, 2000, "الريج جاهز"),
+                          SentenceAssembler.Segment(2100, 4500, "بس نحتاج قطع غيار"),
+                      )
+                  )
+                  assertTrue(r.merged.contains("الريج جاهز"))
+                  assertTrue(r.merged.contains("نحتاج قطع غيار"))
+              }
+
+              @Test fun questionGetsQuestionMarkWithoutRewritingWords() {
+                  val r = SentenceAssembler.assemble(
+                      listOf(
+                          SentenceAssembler.Segment(0, 2000, "شنو المطلوب الحين")
+                      )
+                  )
+                  assertTrue(r.organized.endsWith("؟"))
+                  assertTrue(r.organized.startsWith("شنو المطلوب الحين"))
+              }
+          }
+          EOFT
+
+      - name: V14 static acceptance
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          j = Path('vendor/whisper.cpp/examples/whisper.android.java/app/src/main/jni/whisper/jni.c').read_text()
+          e = Path('app/src/main/java/com/hansom/arzhv13/AccuracyAsrEngine.kt').read_text()
+          a = Path('app/src/main/java/com/hansom/arzhv13/SentenceAssembler.kt').read_text()
+          m = Path('app/src/main/java/com/hansom/arzhv13/MainActivity.kt').read_text()
+          g = Path('app/build.gradle').read_text()
+
+          checks = {
+              'package v14': "applicationId 'com.hansom.arzhv14'" in g,
+              'version 14.0': "versionCode 140" in g and "versionName '14.0'" in g,
+              'Q5 model': 'ggml-model-q5_0.bin' in e and '530_000_000L' in e,
+              'beam search': 'WHISPER_SAMPLING_BEAM_SEARCH' in j,
+              'beam 5': 'params.beam_search.beam_size = 5;' in j,
+              'context enabled': 'params.no_context = false;' in j,
+              'multi segment': 'params.single_segment = false;' in j,
+              'token timestamps': 'params.token_timestamps = true;' in j,
+              'initial prompt': 'KOC' in j and 'مضخة الطين' in j,
+              'whole sentence capture': 'MAX_RECORD_MS = 25_000L' in e,
+              'silence only ends capture': 'AUTO_SILENCE_MS' in e and 'chunks.add' in e,
+              'timestamp assembly': 'getTextSegmentT0' in e and 'getTextSegmentT1' in e,
+              'overlap consensus': 'longestSuffixPrefix' in a,
+              'no Android SpeechRecognizer': 'SpeechRecognizer' not in (e + m),
+              'no translation UI': '翻译' not in m or '本版暂时不翻译' in m,
+          }
+          bad = [k for k,v in checks.items() if not v]
+          for k,v in checks.items():
+              print(('PASS ' if v else 'FAIL ') + k)
+          if bad:
+              raise SystemExit('V14 static acceptance failed: ' + ', '.join(bad))
+          PY
+
+      - name: Unit tests
+        shell: bash
+        run: gradle :app:testDebugUnitTest --stacktrace
+
+      - name: Build V14 APK
+        shell: bash
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify V14 APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import hashlib, os, shutil, subprocess, zipfile
+
+          src = Path('app/build/outputs/apk/debug/app-debug.apk')
+          if not src.is_file() or src.stat().st_size < 10_000_000:
+              raise SystemExit('APK missing or too small')
+
+          with zipfile.ZipFile(src, 'r') as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f'ZIP corruption at {bad}')
+              names = zf.namelist()
+
+          if not any(n.startswith('lib/arm64-v8a/') and 'libwhisper' in n for n in names):
+              raise SystemExit('libwhisper arm64 missing')
+
+          bt = Path(os.environ['ANDROID_HOME']) / 'build-tools' / '35.0.0'
+          aapt = bt / 'aapt'
+          badging = subprocess.run(
+              [str(aapt), 'dump', 'badging', str(src)],
+              check=True, capture_output=True, text=True
+          ).stdout
+
+          for expected in [
+              "package: name='com.hansom.arzhv14'",
+              "versionCode='140'",
+              "versionName='14.0'",
+          ]:
+              if expected not in badging:
+                  raise SystemExit('Badging mismatch: ' + expected)
+
+          dist = Path('dist')
+          dist.mkdir(exist_ok=True)
+          final = dist / 'ArabicAccuracyLab-V14.0-AccuracyFirst.apk'
+          shutil.copy2(src, final)
+          digest = hashlib.sha256(final.read_bytes()).hexdigest()
+          (dist / 'V14-SHA256.txt').write_text(
+              f'{digest}  {final.name}\n', encoding='utf-8'
+          )
+          (dist / 'V14-VERIFICATION.txt').write_text(
+              'V14 Accuracy First VERIFIED\n'
+              'Package: com.hansom.arzhv14\n'
+              'Version: 14.0 (140)\n'
+              'Model: Arabic Dialectal Turbo Q5_0\n'
+              'Decode: Beam Search 5\n'
+              'Mode: whole-utterance, timestamps, no translation\n'
+              f'SHA256: {digest}\n',
+              encoding='utf-8'
+          )
+          print('V14 VERIFIED', final, digest)
+          PY
+
+      - name: Upload V14 APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArabicAccuracyLab-V14.0-AccuracyFirst
+          path: |
+            dist/ArabicAccuracyLab-V14.0-AccuracyFirst.apk
+            dist/V14-SHA256.txt
+            dist/V14-VERIFICATION.txt
+          if-no-files-found: error
+          retention-days: 30
