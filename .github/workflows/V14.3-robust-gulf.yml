@@ -1,0 +1,1113 @@
+name: Build V14.3 Robust Gulf Arabic
+
+on:
+  push:
+    paths:
+      - '.github/workflows/V14.3-robust-gulf.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Set up Java
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Generate Android project
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf app settings.gradle build.gradle gradle.properties
+          mkdir -p app/src/main/java/com/hansom/arzhv142
+          mkdir -p app/src/main/res/values
+          mkdir -p app/src/test/java/com/hansom/arzhv142
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = 'ArabicFastSentenceV142'
+          include ':app'
+          EOF
+
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.24' apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          android.useAndroidX=true
+          android.suppressUnsupportedCompileSdk=35
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          kotlin.code.style=official
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+
+          android {
+              namespace 'com.hansom.arzhv143'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId 'com.hansom.arzhv143'
+                  minSdk 26
+                  targetSdk 35
+                  versionCode 143
+                  versionName '14.3'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+
+          dependencies {
+              testImplementation 'junit:junit:4.13.2'
+          }
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:fontFamily">sans</item>
+                  <item name="android:colorAccent">#111111</item>
+                  <item name="android:statusBarColor">#111111</item>
+                  <item name="android:navigationBarColor">#111111</item>
+                  <item name="android:windowLightStatusBar">false</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.INTERNET" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:label="阿语稳健整句识别 V14.3"
+                  android:theme="@style/AppTheme">
+                  <activity
+                      android:name=".MainActivity"
+                      android:screenOrientation="portrait"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/hansom/arzhv142/SentenceConsensus.kt <<'EOF'
+          package com.hansom.arzhv143
+
+          import kotlin.math.min
+
+          object SentenceConsensus {
+              data class Candidate(
+                  val text: String,
+                  val confidence: Float = -1f,
+              )
+
+              data class PartialState(
+                  val live: String,
+                  val stablePrefix: String,
+              )
+
+              private val domainWords = listOf(
+                  "koc", "كي او سي", "كي أو سي",
+                  "rig", "ريج", "الحفارة", "جهاز الحفر",
+                  "bop", "مانع الانفجار",
+                  "esp", "vsd", "scada",
+                  "mud pump", "مضخة الطين",
+                  "wellhead", "رأس البئر",
+                  "coil tubing", "coiled tubing", "الأنابيب الملفوفة",
+                  "tender", "مناقصة",
+                  "quotation", "عرض سعر"
+              )
+
+              fun chooseBest(candidates: List<Candidate>): String {
+                  if (candidates.isEmpty()) return ""
+                  return candidates
+                      .map { it.copy(text = clean(it.text)) }
+                      .filter { it.text.isNotBlank() }
+                      .maxByOrNull { score(it) }
+                      ?.text
+                      .orEmpty()
+              }
+
+              fun partialConsensus(history: List<String>): PartialState {
+                  val cleanHistory = history
+                      .map(::clean)
+                      .filter { it.isNotBlank() }
+                      .takeLast(4)
+
+                  if (cleanHistory.isEmpty()) return PartialState("", "")
+
+                  val live = cleanHistory.last()
+                  if (cleanHistory.size == 1) return PartialState(live, "")
+
+                  val tokenLists = cleanHistory.map(::words)
+                  var prefix = tokenLists.first().size
+                  for (i in 1 until tokenLists.size) {
+                      prefix = min(prefix, commonPrefix(tokenLists[0], tokenLists[i]))
+                  }
+
+                  // Keep the last two words mutable so partial ASR can still revise them.
+                  val stableCount = (prefix - 2).coerceAtLeast(0)
+                  val stable = tokenLists[0].take(stableCount).joinToString(" ")
+                  return PartialState(live, stable)
+              }
+
+              fun mergeFinal(previousStable: String, currentFinal: String): String {
+                  val a = words(clean(previousStable))
+                  val b = words(clean(currentFinal))
+                  if (a.isEmpty()) return b.joinToString(" ")
+                  if (b.isEmpty()) return a.joinToString(" ")
+
+                  if (b.size >= a.size && sequenceEquals(a, b.take(a.size))) {
+                      return b.joinToString(" ")
+                  }
+
+                  val overlap = longestSuffixPrefix(a, b)
+                  return (a + b.drop(overlap)).joinToString(" ").trim()
+              }
+
+              fun organize(text: String): String {
+                  var s = clean(text)
+                  if (s.isBlank()) return s
+                  s = s.replace(Regex("""\s+([،؛؟.!,:;])"""), "$1")
+                  s = s.replace(Regex("""([،؛؟.!,:;])(?=[\p{L}\p{N}])"""), "$1 ")
+
+                  if (!s.matches(Regex(""".*[؟?!.]$"""))) {
+                      val first = words(s).firstOrNull()?.let(::norm).orEmpty()
+                      val question = first in setOf(
+                          "شنو", "وش", "ايش", "إيش", "ليش", "شلون",
+                          "كيف", "كم", "وين", "من", "منو", "هل", "ما", "ماذا"
+                      )
+                      s += if (question) "؟" else "."
+                  }
+                  return s
+              }
+
+              private fun score(c: Candidate): Double {
+                  val ws = words(c.text)
+                  val confidenceScore =
+                      if (c.confidence in 0f..1f) c.confidence.toDouble() * 4.0 else 0.0
+                  val domain = domainWords.count {
+                      c.text.contains(it, ignoreCase = true)
+                  } * 0.65
+                  val completeness = min(ws.size, 18) * 0.08
+                  val fragmentPenalty =
+                      if (ws.size <= 2 && c.confidence < 0.90f) 1.5 else 0.0
+                  return confidenceScore + domain + completeness - fragmentPenalty
+              }
+
+              private fun clean(s: String): String =
+                  s.replace(Regex("""\s+"""), " ").trim()
+
+              private fun words(s: String): List<String> =
+                  s.split(Regex("""\s+""")).filter { it.isNotBlank() }
+
+              private fun norm(s: String): String =
+                  s.lowercase()
+                      .replace(Regex("""[^\p{L}\p{N}]"""), "")
+                      .replace("أ", "ا")
+                      .replace("إ", "ا")
+                      .replace("آ", "ا")
+                      .replace("ى", "ي")
+                      .replace("ة", "ه")
+
+              private fun same(a: String, b: String): Boolean =
+                  norm(a) == norm(b) && norm(a).isNotBlank()
+
+              private fun commonPrefix(a: List<String>, b: List<String>): Int {
+                  val n = min(a.size, b.size)
+                  var i = 0
+                  while (i < n && same(a[i], b[i])) i++
+                  return i
+              }
+
+              private fun longestSuffixPrefix(a: List<String>, b: List<String>): Int {
+                  val max = min(14, min(a.size, b.size))
+                  for (k in max downTo 1) {
+                      var ok = true
+                      for (i in 0 until k) {
+                          if (!same(a[a.size - k + i], b[i])) {
+                              ok = false
+                              break
+                          }
+                      }
+                      if (ok) return k
+                  }
+                  return 0
+              }
+
+              private fun sequenceEquals(a: List<String>, b: List<String>): Boolean {
+                  if (a.size != b.size) return false
+                  return a.indices.all { same(a[it], b[it]) }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/hansom/arzhv142/FastArabicRecognizer.kt <<'EOF'
+          package com.hansom.arzhv143
+
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.speech.RecognitionListener
+          import android.speech.RecognitionService
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import java.util.ArrayDeque
+          import java.util.concurrent.atomic.AtomicInteger
+
+          class FastArabicRecognizer(
+              private val context: Context,
+              private val listener: Listener,
+          ) {
+              interface Listener {
+                  fun onStatus(text: String)
+                  fun onListeningChanged(listening: Boolean)
+                  fun onRms(db: Float)
+                  fun onPartial(live: String, stable: String)
+                  fun onFinal(
+                      text: String,
+                      locale: String,
+                      provider: String,
+                      latencyMs: Long,
+                      candidates: Int,
+                  )
+                  fun onUnavailable(message: String)
+              }
+
+              companion object {
+                  // Many Android recognizers support ar-SA/ar-AE more reliably than ar-KW
+                  // while still understanding Gulf/Kuwaiti speech.
+                  private val LOCALES = listOf(
+                      "ar-SA",
+                      "ar-AE",
+                      "ar-KW",
+                      "ar",
+                      "ar-IQ",
+                      "ar-EG",
+                  )
+                  private const val FINAL_WATCHDOG_MS = 2600L
+              }
+
+              private val main = Handler(Looper.getMainLooper())
+              private val generation = AtomicInteger(0)
+              private val partialHistory = ArrayDeque<String>()
+
+              private var recognizer: SpeechRecognizer? = null
+              private var providers: List<ComponentName> = emptyList()
+              private var providerIndex = 0
+              private var localeIndex = 0
+              private var startedAt = 0L
+              private var active = false
+              private var awaitingFinal = false
+              private var finalDelivered = false
+              private var currentLocale = LOCALES.first()
+              private var currentProvider = "system-default"
+              private var lastStable = ""
+              private var lastPartial = ""
+
+              fun isAvailable(): Boolean =
+                  SpeechRecognizer.isRecognitionAvailable(context)
+
+              fun isActive(): Boolean = active
+
+              fun start() {
+                  if (!isAvailable()) {
+                      listener.onUnavailable("这台手机没有可用的系统语音识别服务")
+                      return
+                  }
+
+                  cancel()
+                  ensureProviders()
+                  providerIndex = 0
+                  localeIndex = 0
+                  startedAt = System.currentTimeMillis()
+                  active = true
+                  finalDelivered = false
+                  awaitingFinal = false
+                  resetUtteranceState()
+                  startCurrentRoute()
+              }
+
+              fun stop() {
+                  if (!active) return
+                  awaitingFinal = true
+                  listener.onStatus("🧠 已停止收音，等待最终句子…")
+                  runCatching { recognizer?.stopListening() }
+                  scheduleFinalWatchdog(generation.get())
+              }
+
+              fun cancel() {
+                  active = false
+                  awaitingFinal = false
+                  finalDelivered = false
+                  stopInternal(destroy = true)
+                  listener.onListeningChanged(false)
+              }
+
+              fun release() = cancel()
+
+              private fun ensureProviders() {
+                  if (providers.isNotEmpty()) return
+
+                  val resolved = context.packageManager.queryIntentServices(
+                      Intent(RecognitionService.SERVICE_INTERFACE),
+                      0,
+                  ).orEmpty()
+
+                  providers = resolved.mapNotNull { ri ->
+                      val si = ri.serviceInfo ?: return@mapNotNull null
+                      ComponentName(si.packageName, si.name)
+                  }.distinct().sortedBy(::providerRank)
+              }
+
+              private fun providerRank(component: ComponentName): Int {
+                  val text =
+                      (component.packageName + " " + component.className).lowercase()
+                  return when {
+                      "googlequicksearchbox" in text -> 0
+                      "google" in text -> 1
+                      "samsung" in text || "bixby" in text -> 2
+                      else -> 10
+                  }
+              }
+
+              private fun startCurrentRoute() {
+                  if (!active || finalDelivered) return
+
+                  if (localeIndex !in LOCALES.indices) {
+                      localeIndex = 0
+                      providerIndex++
+                  }
+
+                  // providers.size means: try platform default once after explicit services.
+                  if (providerIndex > providers.size) {
+                      finishUnavailable(
+                          "系统ASR没有得到阿语文字。建议在手机中安装/启用 Google Speech Services。"
+                      )
+                      return
+                  }
+
+                  currentLocale = LOCALES[localeIndex]
+                  resetUtteranceState()
+
+                  val token = generation.incrementAndGet()
+                  stopInternal(destroy = true)
+
+                  val component = providers.getOrNull(providerIndex)
+                  currentProvider = component?.packageName ?: "system-default"
+
+                  val sr = runCatching {
+                      if (component == null) {
+                          SpeechRecognizer.createSpeechRecognizer(context)
+                      } else {
+                          SpeechRecognizer.createSpeechRecognizer(context, component)
+                      }
+                  }.getOrElse {
+                      retryNextProvider("识别服务创建失败")
+                      return
+                  }
+                  recognizer = sr
+
+                  sr.setRecognitionListener(object : RecognitionListener {
+                      override fun onReadyForSpeech(params: Bundle?) {
+                          if (!valid(token)) return
+                          listener.onListeningChanged(true)
+                          listener.onStatus(
+                              "🎙 $currentLocale · ${shortProvider()} · 请完整说一句"
+                          )
+                      }
+
+                      override fun onBeginningOfSpeech() {
+                          if (!valid(token)) return
+                          listener.onStatus("🎤 正在听完整句子…")
+                      }
+
+                      override fun onRmsChanged(rmsdB: Float) {
+                          if (!valid(token)) return
+                          listener.onRms(rmsdB)
+                      }
+
+                      override fun onBufferReceived(buffer: ByteArray?) {}
+
+                      override fun onEndOfSpeech() {
+                          if (!valid(token)) return
+                          awaitingFinal = true
+                          listener.onStatus("🧠 语音结束，等待最终结果…")
+                          scheduleFinalWatchdog(token)
+                      }
+
+                      override fun onError(error: Int) {
+                          if (!valid(token) || finalDelivered) return
+                          awaitingFinal = false
+
+                          when (error) {
+                              SpeechRecognizer.ERROR_LANGUAGE_NOT_SUPPORTED,
+                              SpeechRecognizer.ERROR_LANGUAGE_UNAVAILABLE -> {
+                                  retryNextLocale("语言不支持")
+                              }
+
+                              SpeechRecognizer.ERROR_NO_MATCH,
+                              SpeechRecognizer.ERROR_SPEECH_TIMEOUT -> {
+                                  if (lastPartial.isNotBlank()) {
+                                      deliverFallbackPartial()
+                                  } else {
+                                      retryNextLocale("无匹配")
+                                  }
+                              }
+
+                              SpeechRecognizer.ERROR_RECOGNIZER_BUSY -> {
+                                  listener.onStatus("↻ 识别器繁忙，自动重建")
+                                  main.postDelayed({
+                                      if (active && valid(token)) {
+                                          startCurrentRoute()
+                                      }
+                                  }, 350L)
+                              }
+
+                              SpeechRecognizer.ERROR_NETWORK,
+                              SpeechRecognizer.ERROR_NETWORK_TIMEOUT -> {
+                                  if (lastPartial.isNotBlank()) {
+                                      deliverFallbackPartial()
+                                  } else {
+                                      retryNextProvider("当前识别服务网络不可用")
+                                  }
+                              }
+
+                              SpeechRecognizer.ERROR_SERVER_DISCONNECTED,
+                              SpeechRecognizer.ERROR_SERVER,
+                              SpeechRecognizer.ERROR_CLIENT -> {
+                                  if (lastPartial.isNotBlank()) {
+                                      deliverFallbackPartial()
+                                  } else {
+                                      retryNextProvider("识别服务断开")
+                                  }
+                              }
+
+                              SpeechRecognizer.ERROR_TOO_MANY_REQUESTS -> {
+                                  listener.onStatus("↻ 请求过快，1.5秒后换识别服务，请重说一句")
+                                  main.postDelayed({
+                                      if (active && valid(token)) {
+                                          retryNextProvider("请求过快")
+                                      }
+                                  }, 1500L)
+                              }
+
+                              SpeechRecognizer.ERROR_INSUFFICIENT_PERMISSIONS -> {
+                                  finishUnavailable("没有麦克风权限")
+                              }
+
+                              else -> {
+                                  if (lastPartial.isNotBlank()) {
+                                      deliverFallbackPartial()
+                                  } else {
+                                      retryNextLocale("识别错误 $error")
+                                  }
+                              }
+                          }
+                      }
+
+                      override fun onResults(results: Bundle?) {
+                          if (!valid(token) || finalDelivered) return
+
+                          val texts = results
+                              ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                              .orEmpty()
+                          val confidence =
+                              results?.getFloatArray(SpeechRecognizer.CONFIDENCE_SCORES)
+
+                          val candidates = texts.mapIndexed { i, text ->
+                              SentenceConsensus.Candidate(
+                                  text = text,
+                                  confidence = confidence?.getOrNull(i) ?: -1f,
+                              )
+                          }
+
+                          val best = SentenceConsensus.chooseBest(candidates)
+                          if (best.isBlank()) {
+                              if (lastPartial.isNotBlank()) {
+                                  deliverFallbackPartial()
+                              } else {
+                                  retryNextLocale("最终结果为空")
+                              }
+                              return
+                          }
+
+                          deliverFinal(best, candidates.size)
+                      }
+
+                      override fun onPartialResults(partialResults: Bundle?) {
+                          if (!valid(token) || finalDelivered) return
+
+                          val texts = partialResults
+                              ?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                              .orEmpty()
+                          val top = texts.firstOrNull().orEmpty().trim()
+                          if (top.isBlank()) return
+
+                          lastPartial = top
+                          if (partialHistory.lastOrNull() != top) {
+                              partialHistory.addLast(top)
+                              while (partialHistory.size > 4) {
+                                  partialHistory.removeFirst()
+                              }
+                          }
+
+                          val state =
+                              SentenceConsensus.partialConsensus(partialHistory.toList())
+
+                          if (state.stablePrefix.length > lastStable.length) {
+                              lastStable = state.stablePrefix
+                          }
+
+                          listener.onPartial(state.live, lastStable)
+                      }
+
+                      override fun onEvent(eventType: Int, params: Bundle?) {}
+                  })
+
+                  val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
+                      putExtra(
+                          RecognizerIntent.EXTRA_LANGUAGE_MODEL,
+                          RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
+                      )
+                      putExtra(RecognizerIntent.EXTRA_LANGUAGE, currentLocale)
+                      putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
+                      putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
+                      putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, false)
+
+                      putExtra(
+                          RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS,
+                          1000L,
+                      )
+                      putExtra(
+                          RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS,
+                          650L,
+                      )
+                      putExtra(
+                          RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS,
+                          700L,
+                      )
+                  }
+
+                  listener.onListeningChanged(true)
+                  listener.onStatus("● 启动 $currentLocale · ${shortProvider()}…")
+                  sr.startListening(intent)
+              }
+
+              private fun scheduleFinalWatchdog(token: Int) {
+                  main.postDelayed({
+                      if (!valid(token) || finalDelivered) return@postDelayed
+
+                      if (lastPartial.isNotBlank()) {
+                          deliverFallbackPartial()
+                      } else {
+                          retryNextLocale("最终结果超时")
+                      }
+                  }, FINAL_WATCHDOG_MS)
+              }
+
+              private fun deliverFallbackPartial() {
+                  val partial = lastPartial.trim()
+                  if (partial.isBlank()) {
+                      retryNextLocale("partial为空")
+                      return
+                  }
+                  deliverFinal(partial, 1)
+              }
+
+              private fun deliverFinal(best: String, candidates: Int) {
+                  val merged = SentenceConsensus.mergeFinal(lastStable, best)
+                  val organized = SentenceConsensus.organize(merged)
+
+                  finalDelivered = true
+                  awaitingFinal = false
+                  active = false
+
+                  val latency = System.currentTimeMillis() - startedAt
+                  listener.onListeningChanged(false)
+                  listener.onFinal(
+                      organized,
+                      currentLocale,
+                      currentProvider,
+                      latency,
+                      candidates,
+                  )
+              }
+
+              private fun retryNextLocale(reason: String) {
+                  if (!active || finalDelivered) return
+
+                  localeIndex++
+                  if (localeIndex >= LOCALES.size) {
+                      localeIndex = 0
+                      providerIndex++
+                  }
+
+                  listener.onStatus("↪ $reason，已换 Arabic 路线，请重说一句")
+                  main.postDelayed({
+                      if (active && !finalDelivered) startCurrentRoute()
+                  }, 180L)
+              }
+
+              private fun retryNextProvider(reason: String) {
+                  if (!active || finalDelivered) return
+
+                  localeIndex = 0
+                  providerIndex++
+                  listener.onStatus("↪ $reason，已换识别服务，请重说一句")
+                  main.postDelayed({
+                      if (active && !finalDelivered) startCurrentRoute()
+                  }, 180L)
+              }
+
+              private fun resetUtteranceState() {
+                  partialHistory.clear()
+                  lastStable = ""
+                  lastPartial = ""
+                  awaitingFinal = false
+              }
+
+              private fun finishUnavailable(message: String) {
+                  active = false
+                  awaitingFinal = false
+                  listener.onListeningChanged(false)
+                  listener.onUnavailable(message)
+              }
+
+              private fun shortProvider(): String =
+                  currentProvider.substringAfterLast('.').take(30)
+
+              private fun valid(token: Int): Boolean =
+                  active && token == generation.get()
+
+              private fun stopInternal(destroy: Boolean) {
+                  val sr = recognizer ?: return
+                  recognizer = null
+                  runCatching { sr.cancel() }
+                  if (destroy) runCatching { sr.destroy() }
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/hansom/arzhv142/MainActivity.kt <<'EOF'
+          package com.hansom.arzhv143
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+              private lateinit var recognizer: FastArabicRecognizer
+              private lateinit var status: TextView
+              private lateinit var rms: TextView
+              private lateinit var startBtn: Button
+              private lateinit var liveText: TextView
+              private lateinit var stableText: TextView
+              private lateinit var finalText: TextView
+              private lateinit var metrics: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  buildUi()
+
+                  recognizer = FastArabicRecognizer(
+                      this,
+                      object : FastArabicRecognizer.Listener {
+                          override fun onStatus(text: String) {
+                              status.text = text
+                          }
+
+                          override fun onListeningChanged(listening: Boolean) {
+                              startBtn.text =
+                                  if (listening) "■ 停止识别"
+                                  else "🎙 开始极速整句识别"
+                          }
+
+                          override fun onRms(db: Float) {
+                              rms.text = "🎤 系统ASR电平 ${"%.1f".format(db)} dB"
+                          }
+
+                          override fun onPartial(live: String, stable: String) {
+                              liveText.text = live.ifBlank { "…" }
+                              stableText.text =
+                                  stable.ifBlank { "尾部仍在确认…" }
+                          }
+
+                          override fun onFinal(
+                              text: String,
+                              locale: String,
+                              provider: String,
+                              latencyMs: Long,
+                              candidates: Int,
+                          ) {
+                              finalText.text = text
+                              metrics.text =
+                                  "✅ $locale · ${provider.substringAfterLast('.')} · " +
+                                  "${"%.2f".format(latencyMs / 1000.0)}秒 · " +
+                                  "$candidates 个候选"
+                              status.text = "✅ 完整句子已确认"
+                          }
+
+                          override fun onUnavailable(message: String) {
+                              status.text = "⚠ $message"
+                          }
+                      }
+                  )
+
+                  if (
+                      checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                      PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(
+                          arrayOf(Manifest.permission.RECORD_AUDIO),
+                          1420,
+                      )
+                  }
+
+                  if (!recognizer.isAvailable()) {
+                      status.text = "⚠ 当前手机没有可用系统语音识别服务"
+                      startBtn.isEnabled = false
+                  }
+              }
+
+              private fun startOrStop() {
+                  if (
+                      checkSelfPermission(Manifest.permission.RECORD_AUDIO) !=
+                      PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(
+                          arrayOf(Manifest.permission.RECORD_AUDIO),
+                          1420,
+                      )
+                      return
+                  }
+
+                  if (recognizer.isActive()) {
+                      recognizer.stop()
+                  } else {
+                      liveText.text = "等待实时结果…"
+                      stableText.text = "等待稳定词组…"
+                      finalText.text = "等待完整句子…"
+                      metrics.text = "等待识别…"
+                      recognizer.start()
+                  }
+              }
+
+              private fun buildUi() {
+                  val scroll = ScrollView(this)
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(18), dp(20), dp(18), dp(30))
+                      setBackgroundColor(Color.rgb(246, 246, 246))
+                  }
+                  scroll.addView(root)
+
+                  root.addView(TextView(this).apply {
+                      text = "V14.3 · Robust Gulf Arabic"
+                      textSize = 28f
+                      setTypeface(null, 1)
+                      gravity = Gravity.CENTER
+                      setTextColor(Color.BLACK)
+                  })
+
+                  root.addView(TextView(this).apply {
+                      text =
+                          "自动切换 Arabic locale + 系统识别服务\n" +
+                          "ar-SA/ar-AE/ar-KW → 5候选择优 → partial兜底 → 完整句子"
+                      textSize = 15f
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(8), 0, dp(12))
+                  })
+
+                  status = TextView(this).apply {
+                      text = "● 极速识别引擎就绪"
+                      textSize = 16f
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(6), 0, dp(10))
+                  }
+                  root.addView(status)
+
+                  startBtn = Button(this).apply {
+                      text = "🎙 开始极速整句识别"
+                      textSize = 20f
+                      isAllCaps = false
+                      setOnClickListener { startOrStop() }
+                  }
+                  root.addView(startBtn)
+
+                  rms = TextView(this).apply {
+                      text = "🎤 等待语音"
+                      textSize = 14f
+                      setPadding(dp(4), dp(10), dp(4), dp(6))
+                  }
+                  root.addView(rms)
+
+                  root.addView(section("① 实时识别"))
+                  liveText = box("等待实时结果…")
+                  root.addView(liveText)
+
+                  root.addView(section("② 已稳定词组"))
+                  stableText = box("等待稳定词组…")
+                  root.addView(stableText)
+
+                  root.addView(section("③ 最终完整阿语句子"))
+                  finalText = box("等待完整句子…")
+                  root.addView(finalText)
+
+                  metrics = TextView(this).apply {
+                      text = "等待识别…"
+                      textSize = 15f
+                      setPadding(dp(4), dp(14), dp(4), dp(8))
+                  }
+                  root.addView(metrics)
+
+                  root.addView(Button(this).apply {
+                      text = "清空"
+                      isAllCaps = false
+                      setOnClickListener {
+                          recognizer.cancel()
+                          liveText.text = "等待实时结果…"
+                          stableText.text = "等待稳定词组…"
+                          finalText.text = "等待完整句子…"
+                          metrics.text = "等待识别…"
+                          status.text = "● 已清空"
+                      }
+                  })
+
+                  setContentView(scroll)
+              }
+
+              private fun section(value: String) = TextView(this).apply {
+                  text = value
+                  textSize = 18f
+                  setTypeface(null, 1)
+                  setPadding(0, dp(18), 0, dp(6))
+              }
+
+              private fun box(initial: String) = TextView(this).apply {
+                  text = initial
+                  textSize = 21f
+                  minHeight = dp(125)
+                  setPadding(dp(14), dp(14), dp(14), dp(14))
+                  setBackgroundColor(Color.WHITE)
+                  gravity = Gravity.RIGHT
+                  setTextIsSelectable(true)
+              }
+
+              private fun dp(v: Int): Int =
+                  (v * resources.displayMetrics.density + 0.5f).toInt()
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray,
+              ) {
+                  super.onRequestPermissionsResult(
+                      requestCode,
+                      permissions,
+                      grantResults,
+                  )
+                  if (
+                      requestCode == 1420 &&
+                      (grantResults.isEmpty() ||
+                          grantResults[0] != PackageManager.PERMISSION_GRANTED)
+                  ) {
+                      status.text = "⚠ 没有麦克风权限"
+                  }
+              }
+
+              override fun onDestroy() {
+                  if (::recognizer.isInitialized) recognizer.release()
+                  super.onDestroy()
+              }
+          }
+          EOF
+
+          cat > app/src/test/java/com/hansom/arzhv142/SentenceConsensusTest.kt <<'EOF'
+          package com.hansom.arzhv143
+
+          import org.junit.Assert.assertEquals
+          import org.junit.Assert.assertTrue
+          import org.junit.Test
+
+          class SentenceConsensusTest {
+              @Test fun partialConsensusKeepsMutableTail() {
+                  val s = SentenceConsensus.partialConsensus(
+                      listOf(
+                          "شنو المطلوب من الشركة الحين",
+                          "شنو المطلوب من الشركة الحين وكم",
+                          "شنو المطلوب من الشركة الحين وكم السعر",
+                      )
+                  )
+                  assertEquals("شنو المطلوب من", s.stablePrefix)
+                  assertTrue(s.live.contains("وكم السعر"))
+              }
+
+              @Test fun nBestPrefersCompleteCandidate() {
+                  val best = SentenceConsensus.chooseBest(
+                      listOf(
+                          SentenceConsensus.Candidate("السعر", 0.82f),
+                          SentenceConsensus.Candidate(
+                              "شنو المطلوب من الشركة الحين وكم السعر النهائي",
+                              0.78f,
+                          ),
+                      )
+                  )
+                  assertTrue(best.contains("المطلوب من الشركة"))
+              }
+
+              @Test fun mergeDoesNotDuplicateOverlap() {
+                  val x = SentenceConsensus.mergeFinal(
+                      "شنو المطلوب من الشركة",
+                      "من الشركة الحين وكم السعر النهائي",
+                  )
+                  assertEquals(
+                      "شنو المطلوب من الشركة الحين وكم السعر النهائي",
+                      x,
+                  )
+              }
+
+              @Test fun gulfQuestionGetsQuestionMark() {
+                  assertEquals(
+                      "شنو المطلوب من الشركة الحين؟",
+                      SentenceConsensus.organize(
+                          "شنو المطلوب من الشركة الحين"
+                      ),
+                  )
+              }
+          }
+          EOF
+
+      - name: Static checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          m = Path('app/src/main/java/com/hansom/arzhv142/MainActivity.kt').read_text()
+          r = Path('app/src/main/java/com/hansom/arzhv142/FastArabicRecognizer.kt').read_text()
+          c = Path('app/src/main/java/com/hansom/arzhv142/SentenceConsensus.kt').read_text()
+          g = Path('app/build.gradle').read_text()
+          mf = Path('app/src/main/AndroidManifest.xml').read_text()
+
+          checks = {
+              'package': "applicationId 'com.hansom.arzhv143'" in g,
+              'version': "versionCode 143" in g and "versionName '14.3'" in g,
+              'speech recognizer': 'SpeechRecognizer.createSpeechRecognizer' in r,
+              'Gulf routing': '"ar-SA"' in r and '"ar-AE"' in r and '"ar-KW"' in r,
+              'locale fallback': '"ar-SA"' in r and '"ar-AE"' in r and '"ar-IQ"' in r,
+              'partials': 'onPartialResults' in r and 'partialConsensus' in r,
+              'n-best': 'EXTRA_MAX_RESULTS, 5' in r and 'chooseBest' in r,
+              'stable final merge': 'mergeFinal(lastStable, best)' in r,
+              'provider routing': 'queryIntentServices' in r and 'createSpeechRecognizer(context, component)' in r,
+              'partial fallback': 'deliverFallbackPartial' in r,
+              'no-match retry': 'ERROR_NO_MATCH' in r and 'retryNextLocale' in r,
+              'server disconnect recovery': 'ERROR_SERVER_DISCONNECTED' in r and 'retryNextProvider' in r,
+              'too many requests backoff': 'ERROR_TOO_MANY_REQUESTS' in r and '1500L' in r,
+              'provider creation guarded': 'runCatching' in r and '识别服务创建失败' in r,
+              'final guard': 'awaitingFinal' in r and 'finalDelivered' in r,
+              'no local whisper': 'WhisperLib' not in (m + r + c),
+              'recognition service query': 'android.speech.RecognitionService' in mf,
+              'domain scoring': '"koc"' in c and '"rig"' in c and '"esp"' in c,
+              'no translation': '翻译' not in m,
+          }
+
+          bad = [k for k,v in checks.items() if not v]
+          for k,v in checks.items():
+              print(('PASS ' if v else 'FAIL ') + k)
+          if bad:
+              raise SystemExit(
+                  'V14.3 static checks failed: ' + ', '.join(bad)
+              )
+          PY
+
+      - name: Unit tests
+        run: gradle :app:testDebugUnitTest --stacktrace
+
+      - name: Build APK
+        run: gradle :app:assembleDebug --stacktrace
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=app/build/outputs/apk/debug/app-debug.apk
+          test -s "$APK"
+          unzip -t "$APK" >/dev/null
+          unzip -l "$APK" | grep -q 'classes.dex'
+
+          AAPT="$ANDROID_HOME/build-tools/35.0.0/aapt"
+          BADGING="$($AAPT dump badging "$APK")"
+          echo "$BADGING" | grep -q "package: name='com.hansom.arzhv143'"
+          echo "$BADGING" | grep -q "versionCode='143'"
+          echo "$BADGING" | grep -q "versionName='14.3'"
+
+          mkdir -p dist
+          cp "$APK" dist/ArabicRobustGulf-V14.3.apk
+          sha256sum dist/ArabicRobustGulf-V14.3.apk \
+              | tee dist/V14.3-SHA256.txt
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ArabicRobustGulf-V14.3
+          path: |
+            dist/ArabicRobustGulf-V14.3.apk
+            dist/V14.3-SHA256.txt
+          if-no-files-found: error
+          retention-days: 30
